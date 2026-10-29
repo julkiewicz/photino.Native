@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>composition check</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; font: 13px sans-serif; }
+  #panel { position: absolute; top: 0; right: 0; width: 300px; height: 100%; background: rgba(22, 24, 30, 0.92); color: #ddd; }
+  #button { position: absolute; left: 20px; top: 20px; width: 120px; height: 40px; cursor: pointer; }
+  #list { position: absolute; left: 0; top: 100px; right: 0; bottom: 0; overflow-y: scroll; }
+  #list div { height: 20px; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <button id="button">button</button>
+  <div id="list"></div>
+</div>
+<script>
+  // The check host drives this page by web messages and reads its counters back as "report:key=value;...".
+  const counts = { pointerdown: 0, pointermove: 0, pointerup: 0, click: 0, wheel: 0, pointerleave: 0 };
+  const send = (m) => window.external.sendMessage(m);
+  const list = document.getElementById('list');
+  for (let i = 0; i < 300; i++) { const row = document.createElement('div'); row.textContent = 'row ' + i; list.appendChild(row); }
+  for (const kind of ['pointerdown', 'pointermove', 'pointerup', 'click', 'wheel'])
+    document.addEventListener(kind, () => counts[kind]++, true);
+  document.getElementById('panel').addEventListener('pointerleave', () => counts.pointerleave++);
+  let lastClick = '', lastWheel = '';
+  document.addEventListener('wheel', (e) => { lastWheel = (e.target.id || e.target.parentElement.id) + '@' + e.clientX + ',' + e.clientY + ' dy ' + e.deltaY + ' cancelable ' + e.cancelable; }, true);
+  document.getElementById('button').addEventListener('click', (e) => { lastClick = e.clientX + ',' + e.clientY; });
+
+  // The page's hit region: the panel, republished after every layout change of the viewport.
+  function publish() {
+    if (!(window.photino && window.photino.setHitRegions)) return;
+    const r = document.getElementById('panel').getBoundingClientRect();
+    window.photino.setHitRegions([r]);
+    const d = window.devicePixelRatio;
+    send('regions-published:' + [Math.floor(r.left * d), Math.floor(r.top * d), Math.ceil(r.width * d), Math.ceil(r.height * d)].join(','));
+  }
+  new ResizeObserver(publish).observe(document.documentElement);
+
+  function rectOf(id) {
+    const r = document.getElementById(id).getBoundingClientRect(), d = window.devicePixelRatio;
+    return [Math.round(r.left * d), Math.round(r.top * d), Math.round(r.width * d), Math.round(r.height * d)].join(',');
+  }
+
+  function report() {
+    const parts = Object.entries(counts).map(([k, v]) => k + '=' + v);
+    parts.push('scrollTop=' + Math.round(list.scrollTop));
+    parts.push('lastClick=' + lastClick);
+    parts.push('lastWheel=' + lastWheel);
+    parts.push('bodyBackground=' + getComputedStyle(document.body).backgroundColor);
+    parts.push('htmlBackground=' + getComputedStyle(document.documentElement).backgroundColor);
+    parts.push('dpr=' + window.devicePixelRatio);
+    parts.push('viewport=' + innerWidth + 'x' + innerHeight);
+    parts.push('button=' + rectOf('button'));
+    parts.push('list=' + rectOf('list'));
+    parts.push('visibility=' + document.visibilityState);
+    parts.push('hasPhotino=' + !!(window.photino && window.photino.setHitRegions));
+    send('report:' + parts.join(';'));
+  }
+
+  const popups = {};
+  function whenClosed(name, w) {
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (w.closed || Date.now() - started > 5000) { clearInterval(poll); send('popup-closed:' + name + ':' + w.closed); }
+    }, 50);
+  }
+  function openPopup(name) {
+    const w = window.open('https://photino.check/popup.html', name, 'width=400,height=300');
+    if (!w) { send('popup-null:' + name); return; }
+    popups[name] = w;
+    const started = Date.now();
+    const poll = setInterval(() => {
+      let loaded = false;
+      try { loaded = w.document.readyState === 'complete' && String(w.location.href).endsWith('popup.html') && typeof w.callMe === 'function'; } catch (e) {}
+      if (!loaded && Date.now() - started < 10000) return;
+      clearInterval(poll);
+      if (!loaded) { send('popup-failed:' + name); return; }
+      w.__probe = 42;
+      w.document.getElementById('v').textContent = 'from-opener';
+      send('popup-ok:' + name + ':probe=' + w.__probe + ';text=' + w.document.getElementById('v').textContent
+        + ';href=' + w.callMe() + ';opener=' + (w.opener === window) + ';photino=' + !!(w.photino && w.photino.setHitRegions));
+    }, 50);
+  }
+
+  window.external.receiveMessage((message) => {
+    const [command, argument] = [message.split(':')[0], message.slice(message.indexOf(':') + 1)];
+    if (command === 'report') report();
+    else if (command === 'reset') { for (const k in counts) counts[k] = 0; lastClick = ''; list.scrollTop = 0; send('reset-done'); }
+    else if (command === 'publish') publish();
+    else if (command === 'echo') send('echo:' + argument);
+    else if (command === 'send-prefixed') send('__photino_hit_regions__:page:1,2,3,4');
+    else if (command === 'open-popup') openPopup(argument);
+    else if (command === 'close-popup') { popups[argument].close(); whenClosed(argument, popups[argument]); }
+    else if (command === 'watch-popup') whenClosed(argument, popups[argument]);
+  });
+
+  window.addEventListener('load', () => send('ready'));
+</script>
+</body>
+</html>
