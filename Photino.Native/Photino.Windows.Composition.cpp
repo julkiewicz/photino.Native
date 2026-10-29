@@ -629,7 +629,9 @@ void Photino::OnWindowDestroyed()
 	for (int requestId : pendingIds)
 		FinishPopupRequest(requestId, nullptr);
 
-	if (_compositionController || _popupOpenerHwnd != nullptr)
+	// Every window made with the options closes its controller here, so no WebView2 event reaches the host after
+	// the destroyed callback.
+	if (_hasWindowsOptions || _compositionController || _popupOpenerHwnd != nullptr)
 	{
 		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
 		_heldInput.clear();

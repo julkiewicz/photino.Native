@@ -8,8 +8,8 @@
     <authors>TryPhotino</authors>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <license type="expression">Apache-2.0</license>
-    <description>Open native OS windows hosting web UI on Windows, Mac, and Linux (Windows x64 build)</description>
-    <projectUrl>https://github.com/tryphotino/photino.Native</projectUrl>
+    <description>A fork of Photino.Native (Windows x64 build only), with Windows hosting options; see FORK.md in the repository. Photino: open native OS windows hosting web UI.</description>
+    <projectUrl>$repositoryUrl$</projectUrl>
     <repository type="git" url="$repositoryUrl$" commit="$repositoryCommit$" />
     <tags>native</tags>
   </metadata>

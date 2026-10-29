@@ -143,7 +143,7 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 		if (_startUrl == NULL) exit(0);
 		//AutoString wStartUrl = ToUTF16String(initParams->StartUrl);	//Conversion is done in Navigate method. Don't do it twice
 		//wcscpy(_startUrl, wStartUrl);
-		wcscpy(_startUrl, initParams->StartUrl);
+		wcsncpy_s(_startUrl, 2048, initParams->StartUrl, _TRUNCATE);
 	}
 
 	_startString = NULL;
@@ -984,7 +984,8 @@ void Photino::GetAllMonitors(GetAllMonitorsCallback callback)
 void Photino::Invoke(ACTION callback)
 {
 	InvokeWaitInfo waitInfo = {};
-	PostMessage(_hWnd, WM_USER_INVOKE, (WPARAM)callback, (LPARAM)&waitInfo);
+	if (!PostMessage(_hWnd, WM_USER_INVOKE, (WPARAM)callback, (LPARAM)&waitInfo))
+		return;	// the window is gone (or its queue is full): nothing will run the callback, so do not wait for it
 
 	// Block until the callback is actually executed and completed
 	// TODO: Add return values, exception handling, etc.
