@@ -69,6 +69,57 @@ extern "C"
 	{
 		opener->RefusePopupRequest(requestId);
 	}
+
+	// The layout of the Windows option structs as this build sees it, so a binding can check its own against it:
+	// writes the struct's size, then each field's offset in declaration order, and returns how many values that is
+	// (or -1 for an unknown name, or when capacity is too small).
+	EXPORTED int Photino_GetStructLayout_win32(const char* name, int* values, int capacity)
+	{
+#define PHOTINO_LAYOUT(type, ...) \
+		if (strcmp(name, #type) == 0) \
+		{ \
+			const int layout[] = { (int)sizeof(type), __VA_ARGS__ }; \
+			const int count = (int)(sizeof(layout) / sizeof(layout[0])); \
+			if (capacity < count) return -1; \
+			for (int i = 0; i < count; ++i) values[i] = layout[i]; \
+			return count; \
+		}
+#define PHOTINO_OFFSET(type, field) (int)offsetof(type, field)
+		PHOTINO_LAYOUT(PhotinoInitParams, PHOTINO_OFFSET(PhotinoInitParams, Size))
+		PHOTINO_LAYOUT(PhotinoWindowsOptions,
+			PHOTINO_OFFSET(PhotinoWindowsOptions, StartHidden),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, CompositionHosting),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, HitRegionHoldMilliseconds),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, HostInputHandler),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupRequestedHandler),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupRequestTimeoutMilliseconds),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupOpener),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupRequestId),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, DestroyedHandler),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, Size))
+		PHOTINO_LAYOUT(PhotinoHostInput,
+			PHOTINO_OFFSET(PhotinoHostInput, Message),
+			PHOTINO_OFFSET(PhotinoHostInput, X),
+			PHOTINO_OFFSET(PhotinoHostInput, Y),
+			PHOTINO_OFFSET(PhotinoHostInput, WParam),
+			PHOTINO_OFFSET(PhotinoHostInput, LParam))
+		PHOTINO_LAYOUT(PhotinoSurfaceBounds,
+			PHOTINO_OFFSET(PhotinoSurfaceBounds, Surface),
+			PHOTINO_OFFSET(PhotinoSurfaceBounds, X),
+			PHOTINO_OFFSET(PhotinoSurfaceBounds, Y),
+			PHOTINO_OFFSET(PhotinoSurfaceBounds, Width),
+			PHOTINO_OFFSET(PhotinoSurfaceBounds, Height))
+		PHOTINO_LAYOUT(PhotinoPopupFeatures,
+			PHOTINO_OFFSET(PhotinoPopupFeatures, HasPosition),
+			PHOTINO_OFFSET(PhotinoPopupFeatures, HasSize),
+			PHOTINO_OFFSET(PhotinoPopupFeatures, Left),
+			PHOTINO_OFFSET(PhotinoPopupFeatures, Top),
+			PHOTINO_OFFSET(PhotinoPopupFeatures, Width),
+			PHOTINO_OFFSET(PhotinoPopupFeatures, Height))
+#undef PHOTINO_OFFSET
+#undef PHOTINO_LAYOUT
+		return -1;
+	}
 #elif __APPLE__
 	EXPORTED void Photino_register_mac()
 	{

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A Windows x64 only Photino.Native package, for a fork's own feed (the full nuspec needs every platform's build). -->
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Photino.Native</id>
+    <version>$version$</version>
+    <title>Photino</title>
+    <authors>TryPhotino</authors>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <license type="expression">Apache-2.0</license>
+    <description>Open native OS windows hosting web UI on Windows, Mac, and Linux (Windows x64 build)</description>
+    <projectUrl>https://github.com/tryphotino/photino.Native</projectUrl>
+    <repository type="git" url="$repositoryUrl$" commit="$repositoryCommit$" />
+    <tags>native</tags>
+  </metadata>
+  <files>
+    <file src="../../Photino.Native/x64/$configuration$/Photino.Native.dll" target="runtimes/win-x64/native/Photino.Native.dll" />
+    <file src="../../Photino.Native/x64/$configuration$/WebView2Loader.dll" target="runtimes/win-x64/native/WebView2Loader.dll" />
+    <file src="../../LICENSE" target="LICENSE" />
+  </files>
+</package>

@@ -1,0 +1,11 @@
+<!-- Packs Photino.Native.Windows.nuspec with dotnet pack (no nuget.exe needed); builds nothing itself. -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoBuild>true</NoBuild>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <NuspecFile>Photino.Native.Windows.nuspec</NuspecFile>
+    <NuspecProperties>version=$(PackageVersion);configuration=$(Configuration);repositoryUrl=$(RepositoryUrl);repositoryCommit=$(RepositoryCommit)</NuspecProperties>
+  </PropertyGroup>
+</Project>

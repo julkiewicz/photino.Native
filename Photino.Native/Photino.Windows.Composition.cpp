@@ -645,4 +645,7 @@ void Photino::OnWindowDestroyed()
 		_dcompDevice.reset();
 		_compositionController.reset();
 	}
+
+	if (_destroyedCallback != nullptr)
+		_destroyedCallback();
 }

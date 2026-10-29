@@ -113,6 +113,7 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 		_hitRegionHoldMilliseconds = options->HitRegionHoldMilliseconds == 0 ? 100 : options->HitRegionHoldMilliseconds;
 		_hostInputCallback = options->HostInputHandler;
 		_popupRequestedCallback = options->PopupRequestedHandler;
+		_destroyedCallback = options->DestroyedHandler;
 		if (options->PopupOpener != nullptr)
 		{
 			_popupOpenerHwnd = options->PopupOpener->getHwnd();

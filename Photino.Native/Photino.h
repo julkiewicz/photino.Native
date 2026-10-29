@@ -167,6 +167,8 @@ typedef bool (*HostInputCallback)(const PhotinoHostInput *input);
 // The page's script is blocked until the request is fulfilled or refused, so fulfil it promptly; a request still
 // open after PopupRequestTimeoutMilliseconds is refused.
 typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri, const PhotinoPopupFeatures *features);
+// The window was destroyed (WM_DESTROY): no callback is made for this window after this one.
+typedef void (*DestroyedCallback)();
 
 struct PhotinoWindowsOptions
 {
@@ -196,6 +198,8 @@ struct PhotinoWindowsOptions
 	// environment and becomes the page's new window (no StartUrl or StartString needed).
 	Photino *PopupOpener;
 	int PopupRequestId;
+	// Called once when the window is destroyed, after its surface handles are closed. May be null.
+	DestroyedCallback DestroyedHandler;
 
 	int Size;
 };
@@ -274,6 +278,7 @@ private:
 	int _hitRegionHoldMilliseconds = 0;
 	HostInputCallback _hostInputCallback = nullptr;
 	PopupRequestedCallback _popupRequestedCallback = nullptr;
+	DestroyedCallback _destroyedCallback = nullptr;
 	HWND _popupOpenerHwnd = nullptr;
 	int _popupRequestId = 0;
 	int _nextPopupRequestId = 0;
