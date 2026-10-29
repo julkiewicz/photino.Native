@@ -59,6 +59,16 @@ extern "C"
 	{
 		instance->SetHitRegions(rects, count, regionsArePage);
 	}
+
+	EXPORTED void Photino_Show_win32(Photino* instance)
+	{
+		instance->ShowHidden();
+	}
+
+	EXPORTED void Photino_RefusePopupRequest_win32(Photino* opener, int requestId)
+	{
+		opener->RefusePopupRequest(requestId);
+	}
 #elif __APPLE__
 	EXPORTED void Photino_register_mac()
 	{

@@ -27,10 +27,10 @@ static bool IsKeyMessage(UINT message)
 		|| message == WM_CHAR || message == WM_SYSCHAR;
 }
 
-HRESULT Photino::BuildCompositionTree()
+bool Photino::CreateCompositionTree()
 {
 	// One tree per window: a root visual holding the host's visual (the surfaces the host fills) and, above it, the
-	// page's visual (the composition controller's root visual target).
+	// page's visual (the composition controller's root visual target, attached when the controller exists).
 	HRESULT hr = DCompositionCreateDevice2(nullptr, IID_PPV_ARGS(&_dcompDevice));
 	if (SUCCEEDED(hr)) hr = _dcompDevice->CreateTargetForHwnd(_hWnd, TRUE, &_dcompTarget);
 	if (SUCCEEDED(hr)) hr = _dcompDevice->CreateVisual(&_dcompRootVisual);
@@ -39,19 +39,49 @@ HRESULT Photino::BuildCompositionTree()
 	if (SUCCEEDED(hr)) hr = _dcompRootVisual->AddVisual(_dcompHostVisual.get(), FALSE, nullptr);
 	if (SUCCEEDED(hr)) hr = _dcompRootVisual->AddVisual(_dcompWebVisual.get(), TRUE, _dcompHostVisual.get());
 	if (SUCCEEDED(hr)) hr = _dcompTarget->SetRoot(_dcompRootVisual.get());
-	if (SUCCEEDED(hr)) hr = _compositionController->put_RootVisualTarget(_dcompWebVisual.get());
 	if (SUCCEEDED(hr)) hr = _dcompDevice->Commit();
 	if (FAILED(hr))
 	{
+		// For example a layered (Transparent) window, which DirectComposition cannot target.
+		_dcompWebVisual.reset();
+		_dcompHostVisual.reset();
+		_dcompRootVisual.reset();
+		_dcompTarget.reset();
 		_dcompDevice.reset();
-		return hr;
+		return false;
 	}
 
 	RECT client;
 	GetClientRect(_hWnd, &client);
 	_lastClientSize = { client.right - client.left, client.bottom - client.top };
+	return true;
+}
+
+HRESULT Photino::AttachCompositionController()
+{
+	if (!_dcompDevice)
+		return E_FAIL;
+	HRESULT hr = _compositionController->put_RootVisualTarget(_dcompWebVisual.get());
+	if (SUCCEEDED(hr)) hr = _dcompDevice->Commit();
 	MarkHitRegionsStale();	// until the page publishes its first regions
 	return hr;
+}
+
+UINT Photino::PlacementFlags()
+{
+	// A window made with the Windows options, or a hidden one, is never activated by its own placement calls.
+	return (_hasWindowsOptions || !IsWindowVisible(_hWnd)) ? SWP_NOACTIVATE : 0;
+}
+
+void Photino::ShowHidden()
+{
+	_startHidden = false;
+	ShowWindow(_hWnd, _pendingShowCommand);
+}
+
+void Photino::RefusePopupRequest(int requestId)
+{
+	FinishPopupRequest(requestId, nullptr);
 }
 
 void Photino::GetCompositionHostingEnabled(bool* enabled)
@@ -181,13 +211,91 @@ void Photino::MarkHitRegionsStale()
 	_hitRegionsStaleSince = GetTickCount64();
 }
 
+static int ButtonOf(UINT message, WPARAM wParam)
+{
+	switch (message)
+	{
+	case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK: return VK_LBUTTON;
+	case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK: return VK_RBUTTON;
+	case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK: return VK_MBUTTON;
+	default: return GET_XBUTTON_WPARAM(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+	}
+}
+
 void Photino::FlushHeldInput()
 {
 	KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
 	std::vector<HeldInput> held;
 	held.swap(_heldInput);
-	for (const HeldInput& input : held)
+	bool foreground = GetForegroundWindow() == _hWnd;
+	for (size_t i = 0; i < held.size(); ++i)
+	{
+		const HeldInput& input = held[i];
+		if (input.message == WM_MOUSELEAVE)
+		{
+			HandleMouseLeave();
+			continue;
+		}
+		if (foreground && IsMousePress(input.message))
+		{
+			// A real press whose button was released outside the window while it was held: its release never came,
+			// so routing the press would leave that side with a button down.
+			int button = ButtonOf(input.message, input.wParam);
+			bool released = false;
+			for (size_t j = i + 1; j < held.size() && !released; ++j)
+				released = IsMouseRelease(held[j].message) && ButtonOf(held[j].message, held[j].wParam) == button;
+			if (!released && (GetAsyncKeyState(button) & 0x8000) == 0)
+				continue;
+		}
 		RouteMouse(input.message, input.wParam, input.lParam);
+	}
+	if (_inputOwner == InputTarget::None && GetCapture() == _hWnd)
+		ReleaseCapture();
+}
+
+void Photino::EndMouseOwner()
+{
+	// The side that owned a drag loses it (capture taken elsewhere, the window deactivated): tell it, so no button
+	// stays down there.
+	InputTarget owner = _inputOwner;
+	_inputOwner = InputTarget::None;
+	if (owner == InputTarget::Page)
+	{
+		const struct { WPARAM key; UINT up; } buttons[] = {
+			{ MK_LBUTTON, WM_LBUTTONUP }, { MK_RBUTTON, WM_RBUTTONUP }, { MK_MBUTTON, WM_MBUTTONUP },
+			{ MK_XBUTTON1, WM_XBUTTONUP }, { MK_XBUTTON2, WM_XBUTTONUP } };
+		WPARAM keys = _ownerMouseKeys;
+		for (const auto& button : buttons)
+		{
+			if ((keys & button.key) == 0)
+				continue;
+			keys &= ~button.key;
+			UINT32 data = button.key == MK_XBUTTON1 ? XBUTTON1 : button.key == MK_XBUTTON2 ? XBUTTON2 : 0;
+			_compositionController->SendMouseInput((COREWEBVIEW2_MOUSE_EVENT_KIND)button.up,
+				(COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS)keys, data, _ownerMousePoint);
+		}
+		_compositionController->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, { 0, 0 });
+		_hoverTarget = InputTarget::None;
+	}
+	else if (owner == InputTarget::Host)
+	{
+		SendHostInput(WM_CAPTURECHANGED, _ownerMousePoint, 0, 0);
+	}
+	_ownerMouseKeys = 0;
+	if (GetCapture() == _hWnd)
+		ReleaseCapture();
+}
+
+void Photino::HandleMouseLeave()
+{
+	_trackingMouseLeave = false;
+	if (_inputOwner != InputTarget::None)
+		return;
+	if (_hoverTarget == InputTarget::Page)
+		_compositionController->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, { 0, 0 });
+	else if (_hoverTarget == InputTarget::Host)
+		SendHostInput(WM_MOUSELEAVE, { 0, 0 }, 0, 0);
+	_hoverTarget = InputTarget::None;
 }
 
 Photino::InputTarget Photino::TargetAt(POINT point)
@@ -204,12 +312,12 @@ Photino::InputTarget Photino::TargetAt(POINT point)
 	return inside == _hitRegionsArePage ? InputTarget::Page : InputTarget::Host;
 }
 
-void Photino::SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam)
+bool Photino::SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam)
 {
 	if (_hostInputCallback == nullptr)
-		return;
+		return false;
 	PhotinoHostInput input = { message, point.x, point.y, (unsigned long long)wParam, (long long)lParam };
-	_hostInputCallback(&input);
+	return _hostInputCallback(&input);
 }
 
 void Photino::RouteMouse(UINT message, WPARAM wParam, LPARAM lParam)
@@ -218,7 +326,10 @@ void Photino::RouteMouse(UINT message, WPARAM wParam, LPARAM lParam)
 	if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
 		ScreenToClient(_hWnd, &point);
 
-	if (!_trackingMouseLeave)
+	// Track the leave only while the real cursor is over the window: TrackMouseEvent posts a leave at once when it
+	// is not (a wheel sent to the focus window from elsewhere, or a message posted to the window).
+	POINT cursor;
+	if (!_trackingMouseLeave && GetCursorPos(&cursor) && WindowFromPoint(cursor) == _hWnd)
 	{
 		TRACKMOUSEEVENT track = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, _hWnd, 0 };
 		_trackingMouseLeave = TrackMouseEvent(&track) != FALSE;
@@ -267,6 +378,11 @@ void Photino::RouteMouse(UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	const WPARAM buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
+	if (_inputOwner != InputTarget::None)
+	{
+		_ownerMouseKeys = GET_KEYSTATE_WPARAM(wParam) & buttons;
+		_ownerMousePoint = point;
+	}
 	if (IsMouseRelease(message) && (GET_KEYSTATE_WPARAM(wParam) & buttons) == 0 && _inputOwner != InputTarget::None)
 	{
 		_inputOwner = InputTarget::None;
@@ -275,8 +391,17 @@ void Photino::RouteMouse(UINT message, WPARAM wParam, LPARAM lParam)
 	}
 }
 
-bool Photino::HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result)
+bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result)
 {
+	if (message == WM_TIMER && wParam > PHOTINO_POPUP_REQUEST_TIMER_BASE && wParam <= PHOTINO_POPUP_REQUEST_TIMER_BASE + 0xFFFFF)
+	{
+		// An accepted popup request the host did not fulfil in time: refuse it, so the page's script runs on.
+		KillTimer(_hWnd, wParam);
+		FinishPopupRequest((int)(wParam - PHOTINO_POPUP_REQUEST_TIMER_BASE), nullptr);
+		*result = 0;
+		return true;
+	}
+
 	if (!_compositionController || !_dcompDevice)
 		return false;
 
@@ -288,7 +413,11 @@ bool Photino::HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lPara
 			if (waited < (ULONGLONG)_hitRegionHoldMilliseconds)
 			{
 				if (_heldInput.empty())
+				{
 					SetTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID, (UINT)(_hitRegionHoldMilliseconds - waited), nullptr);
+					if (IsMousePress(message) && GetForegroundWindow() == _hWnd)
+						SetCapture(_hWnd);	// so the release arrives even outside the window
+				}
 				_heldInput.push_back({ message, wParam, lParam });
 				*result = 0;
 				return true;
@@ -305,31 +434,64 @@ bool Photino::HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lPara
 	{
 	case WM_MOUSELEAVE:
 	{
-		_trackingMouseLeave = false;
-		if (_inputOwner == InputTarget::None)
-		{
-			if (_hoverTarget == InputTarget::Page)
-				_compositionController->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, { 0, 0 });
-			else if (_hoverTarget == InputTarget::Host)
-				SendHostInput(WM_MOUSELEAVE, { 0, 0 }, 0, 0);
-			_hoverTarget = InputTarget::None;
-		}
+		if (!_heldInput.empty())
+			_heldInput.push_back({ message, wParam, lParam });	// after the held moves, in order
+		else
+			HandleMouseLeave();
 		*result = 0;
 		return true;
 	}
 	case WM_CAPTURECHANGED:
 	{
-		// Capture taken by another window ends the drag.
-		if ((HWND)lParam != _hWnd)
-			_inputOwner = InputTarget::None;
+		// Capture taken by another window (or released by the system) ends the drag on its side.
+		if ((HWND)lParam != _hWnd && _inputOwner != InputTarget::None)
+			EndMouseOwner();
 		return false;
+	}
+	case WM_SETFOCUS:
+	case WM_KILLFOCUS:
+	{
+		// The host learns when the keyboard comes to or leaves the window (to the page or another app), so it can
+		// let go of keys it holds.
+		SendHostInput(message, { 0, 0 }, wParam, lParam);
+		return false;
+	}
+	case WM_ACTIVATE:
+	{
+		if (LOWORD(wParam) == WA_INACTIVE)
+		{
+			_hostHadFocus = GetFocus() == _hWnd;
+			if (_inputOwner != InputTarget::None)
+				EndMouseOwner();
+			return false;
+		}
+		// Give the keyboard back to the side that had it, or for a click to the side clicked.
+		bool host = _hostHadFocus;
+		if (LOWORD(wParam) == WA_CLICKACTIVE)
+		{
+			POINT cursor;
+			GetCursorPos(&cursor);
+			ScreenToClient(_hWnd, &cursor);
+			host = TargetAt(cursor) == InputTarget::Host;
+		}
+		if (!host)
+			return false;	// the usual: the page takes the keyboard
+		SetFocus(_hWnd);
+		InvokeFocusIn();
+		*result = 0;
+		return true;
 	}
 	case WM_TIMER:
 	{
 		if (wParam != HIT_REGION_HOLD_TIMER_ID)
 			return false;
-		_hitRegionsStale = false;
-		FlushHeldInput();
+		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
+		// A late timer from an earlier hold must not end this one early.
+		if (_hitRegionsStale && !_heldInput.empty() && GetTickCount64() - _hitRegionsStaleSince >= (ULONGLONG)_hitRegionHoldMilliseconds)
+		{
+			_hitRegionsStale = false;
+			FlushHeldInput();
+		}
 		*result = 0;
 		return true;
 	}
@@ -341,8 +503,16 @@ bool Photino::HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lPara
 		GetCursorPos(&cursor);
 		ScreenToClient(_hWnd, &cursor);
 		InputTarget target = _inputOwner != InputTarget::None ? _inputOwner : TargetAt(cursor);
+		if (target == InputTarget::Host)
+		{
+			// The host may set its own cursor (a crosshair, none while looking) and return true.
+			if (!SendHostInput(message, cursor, wParam, lParam))
+				return false;
+			*result = TRUE;
+			return true;
+		}
 		HCURSOR pageCursor = nullptr;
-		if (target != InputTarget::Page || FAILED(_compositionController->get_Cursor(&pageCursor)))
+		if (FAILED(_compositionController->get_Cursor(&pageCursor)))
 			return false;
 		SetCursor(pageCursor);
 		*result = TRUE;
@@ -370,8 +540,11 @@ bool Photino::HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lPara
 	}
 	default:
 		// Keys reach the window only while it has focus (a press on the host's side took it from the page).
-		if (IsKeyMessage(message))
-			SendHostInput(message, { 0, 0 }, wParam, lParam);
+		if (IsKeyMessage(message) && SendHostInput(message, { 0, 0 }, wParam, lParam))
+		{
+			*result = 0;	// handled by the host: no window menu for Alt or F10
+			return true;
+		}
 		return false;
 	}
 }
@@ -386,6 +559,7 @@ void Photino::FinishPopupRequest(int requestId, ICoreWebView2* newWindow)
 
 	if (newWindow != nullptr)
 		pending.args->put_NewWindow(newWindow);
+	KillTimer(_hWnd, PHOTINO_POPUP_REQUEST_TIMER_BASE + requestId);
 	pending.args->put_Handled(TRUE);	// handled with no new window: window.open returns null in the page
 	if (pending.deferral)
 		pending.deferral->Complete();

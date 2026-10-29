@@ -119,7 +119,8 @@ struct PhotinoInitParams
 
 #ifdef _WIN32
 // Windows-only hosting options, passed with Photino_ctorWithOptions_win32. A zeroed struct (with Size set) gives
-// Photino's usual behavior; Photino_ctor is unchanged.
+// Photino's usual behavior, except that the window's own placement calls (position, size, topmost, centre) never
+// activate it; Photino_ctor is unchanged. Every Photino_*_win32 call for these options is made on the window's thread.
 
 // One mouse or key message the composition mode routes to the host instead of the page. X and Y are in client
 // pixels (also for the wheel, whose LParam is in screen pixels); WParam and LParam are the window message's own.
@@ -142,18 +143,40 @@ struct PhotinoSurfaceBounds
 	int Height;
 };
 
-typedef void (*HostInputCallback)(const PhotinoHostInput *input);
-// The page called window.open. Return true to host it: the host then creates a window (now or later, on this
-// thread) with PhotinoWindowsOptions.PopupOpener set to this instance and PopupRequestId to requestId. Return false
-// to refuse it (window.open returns null in the page).
-typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri);
+// Timer ids Photino uses on a window with these options: a popup request's timeout is this plus its id.
+#define PHOTINO_POPUP_REQUEST_TIMER_BASE 0x50500000
+
+// What window.open asked for (its features string), in pixels; a Has flag is false when the page gave no value.
+struct PhotinoPopupFeatures
+{
+	bool HasPosition;
+	bool HasSize;
+	int Left;
+	int Top;
+	int Width;
+	int Height;
+};
+
+// Return true when the host handled the message: Photino then skips its default handling (for example a key that
+// would open the window menu, or WM_SETCURSOR when the host set its own cursor).
+typedef bool (*HostInputCallback)(const PhotinoHostInput *input);
+// The page called window.open. Return true to host it: the host then creates a window (on this thread) with
+// PhotinoWindowsOptions.PopupOpener set to this instance and PopupRequestId to requestId, or refuses it later with
+// Photino_RefusePopupRequest_win32. Return false to refuse it now (window.open returns null in the page).
+// The page's script is blocked until the request is fulfilled or refused, so fulfil it promptly; a request still
+// open after PopupRequestTimeoutMilliseconds is refused.
+typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri, const PhotinoPopupFeatures *features);
 
 struct PhotinoWindowsOptions
 {
-	// Create the window without showing it (the page still loads and runs).
+	// Create the window without showing it (the page still loads, lays out and runs; it never takes focus). Minimized
+	// and Maximized are kept for Photino_Show_win32, which shows it.
 	bool StartHidden;
 	// Host WebView2 through its composition controller in a DirectComposition tree: the page is a transparent
-	// visual above a host layer that Photino_AddCompositionSurface_win32 fills; mouse input is routed by hit regions.
+	// visual above a host layer that Photino_AddCompositionSurface_win32 fills (usable as soon as the window exists;
+	// closing the window closes the surface handles it made). Mouse input is routed by hit regions: until the page
+	// (or the host) publishes some, every input goes to the host. If composition is not available the window falls
+	// back to the usual hosting; Photino_GetCompositionHostingEnabled_win32 says which one is active.
 	bool CompositionHosting;
 	// Composition mode: after the window's size or DPI changes, a press waits up to this long for the page to
 	// publish its new hit regions before it is routed. 0 means the default (100 ms), a negative value turns it off.
@@ -163,6 +186,8 @@ struct PhotinoWindowsOptions
 	HostInputCallback HostInputHandler;
 	// Called when the page calls window.open. Null keeps WebView2's own behavior.
 	PopupRequestedCallback PopupRequestedHandler;
+	// An accepted popup request not fulfilled within this is refused. 0 means the default (5000 ms), negative never.
+	int PopupRequestTimeoutMilliseconds;
 	// Set both to make this window the popup a PopupRequestedCallback accepted: it shares the opener's WebView2
 	// environment and becomes the page's new window (no StartUrl or StartString needed).
 	Photino *PopupOpener;
@@ -233,7 +258,13 @@ private:
 		wil::com_ptr<ICoreWebView2NewWindowRequestedEventArgs> args;
 		wil::com_ptr<ICoreWebView2Deferral> deferral;
 	};
+	bool _hasWindowsOptions = false;
 	bool _startHidden = false;
+	int _pendingShowCommand = SW_SHOW;
+	int _popupRequestTimeoutMilliseconds = 0;
+	bool _hostHadFocus = false;
+	WPARAM _ownerMouseKeys = 0;
+	POINT _ownerMousePoint = {};
 	bool _compositionHosting = false;
 	int _hitRegionHoldMilliseconds = 0;
 	HostInputCallback _hostInputCallback = nullptr;
@@ -260,13 +291,17 @@ private:
 	SIZE _lastClientSize = {};
 	void CreateWebViewController(ICoreWebView2Environment *env);
 	HRESULT OnWebViewControllerCreated(HRESULT result, ICoreWebView2Controller *controller);
-	HRESULT BuildCompositionTree();
+	bool CreateCompositionTree();
+	HRESULT AttachCompositionController();
+	void EndMouseOwner();
+	void HandleMouseLeave();
+	UINT PlacementFlags();
 	bool TakeHitRegionMessage(LPCWSTR message);
 	void MarkHitRegionsStale();
 	void FlushHeldInput();
 	InputTarget TargetAt(POINT point);
 	void RouteMouse(UINT message, WPARAM wParam, LPARAM lParam);
-	void SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam);
+	bool SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam);
 	void FinishPopupRequest(int requestId, ICoreWebView2 *newWindow);
 
 #elif __linux__
@@ -318,7 +353,9 @@ public:
 	AutoString ToUTF16String(AutoString source);
 	AutoString ToUTF8String(AutoString source);
 	Photino(PhotinoInitParams *initParams, const PhotinoWindowsOptions *options);
-	bool HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result);
+	bool HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result);
+	void ShowHidden();
+	void RefusePopupRequest(int requestId);
 	void OnWindowDestroyed();
 	void GetCompositionHostingEnabled(bool *enabled);
 	HANDLE AddCompositionSurface(int x, int y, int width, int height);

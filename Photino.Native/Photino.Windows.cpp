@@ -106,7 +106,9 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 			MessageBox(nullptr, msg, L"Native Initialization Failed", MB_OK);
 			exit(0);
 		}
+		_hasWindowsOptions = true;
 		_startHidden = options->StartHidden;
+		_popupRequestTimeoutMilliseconds = options->PopupRequestTimeoutMilliseconds == 0 ? 5000 : options->PopupRequestTimeoutMilliseconds;
 		_compositionHosting = options->CompositionHosting;
 		_hitRegionHoldMilliseconds = options->HitRegionHoldMilliseconds == 0 ? 100 : options->HitRegionHoldMilliseconds;
 		_hostInputCallback = options->HostInputHandler;
@@ -298,6 +300,11 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 	);
 	hwndToPhotino[_hWnd] = this;
 
+	// The composition tree exists from the start, so the host can add its surfaces right away; only the page's
+	// visual waits for the controller.
+	if (_compositionHosting && !CreateCompositionTree())
+		_compositionHosting = false;
+
 	if (initParams->WindowIconFile != NULL)
 	{
 		AutoString wWindowIconFile = ToUTF16String(initParams->WindowIconFile);
@@ -308,11 +315,20 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 	if (initParams->CenterOnInitialize)
 		Photino::Center();
 
+	if (_startHidden)
+	{
+		// Kept for Photino_Show_win32: showing it now would show (and activate) the window.
+		if (initParams->Minimized) _pendingShowCommand = SW_SHOWMINNOACTIVE;
+		if (initParams->Maximized) _pendingShowCommand = SW_SHOWMAXIMIZED;
+	}
+	else
+	{
 	if (initParams->Minimized)
 		SetMinimized(true);
 
 	if (initParams->Maximized)
 		SetMaximized(true);
+	}
 
 	if (initParams->Resizable == false)
 		SetResizable(false);
@@ -332,7 +348,7 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 
 	_dialog = new PhotinoDialog(this);
 
-	bool isAlreadyShown = initParams->Minimized || initParams->Maximized;
+	bool isAlreadyShown = !_startHidden && (initParams->Minimized || initParams->Maximized);
 	Photino::Show(isAlreadyShown);
 }
 
@@ -357,7 +373,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	if (composed != hwndToPhotino.end() && composed->second != nullptr)
 	{
 		LRESULT result = 0;
-		if (composed->second->HandleCompositionMessage(uMsg, wParam, lParam, &result))
+		if (composed->second->HandleHostingMessage(uMsg, wParam, lParam, &result))
 			return result;
 	}
 
@@ -839,7 +855,7 @@ void Photino::SetMaxSize(int width, int height)
 
 void Photino::SetPosition(int x, int y)
 {
-	SetWindowPos(_hWnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+	SetWindowPos(_hWnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | PlacementFlags());
 }
 
 void Photino::SetResizable(bool resizable)
@@ -852,7 +868,7 @@ void Photino::SetResizable(bool resizable)
 
 void Photino::SetSize(int width, int height)
 {
-	SetWindowPos(_hWnd, HWND_TOP, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER);
+	SetWindowPos(_hWnd, HWND_TOP, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | PlacementFlags());
 }
 
 void Photino::SetTitle(AutoString title)
@@ -881,7 +897,7 @@ void Photino::SetTopmost(bool topmost)
 	if (topmost) style |= WS_EX_TOPMOST;
 	else style &= (~WS_EX_TOPMOST);
 	SetWindowLongPtr(_hWnd, GWL_STYLE, style);
-	SetWindowPos(_hWnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+	SetWindowPos(_hWnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | PlacementFlags());
 }
 
 void Photino::SetZoom(int zoom)
@@ -1093,7 +1109,17 @@ void Photino::CreateWebViewController(ICoreWebView2Environment* env)
 						_compositionController = compositionController;
 						result = compositionController->QueryInterface(IID_PPV_ARGS(&controller));
 						if (result == S_OK)
-							result = BuildCompositionTree();
+							result = AttachCompositionController();
+						if (result != S_OK)
+						{
+							// No usable composition: host the page the usual way instead of leaving the window blank.
+							if (controller)
+								controller->Close();
+							_compositionController.reset();
+							_compositionHosting = false;
+							CreateWebViewController(_webviewEnvironment ? _webviewEnvironment.get() : nullptr);
+							return S_OK;
+						}
 					}
 					return OnWebViewControllerCreated(result, controller.get());
 				}).Get());
@@ -1126,7 +1152,12 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 	}
 
 	HRESULT envResult = controller->QueryInterface(&_webviewController);
-	if (envResult != S_OK) { return envResult; }
+	if (envResult != S_OK)
+	{
+		if (opener)
+			opener->FinishPopupRequest(_popupRequestId, nullptr);
+		return envResult;
+	}
 	_webviewController->get_CoreWebView2(&_webviewWindow);
 
 	if (_startHidden)
@@ -1242,8 +1273,25 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 				args->GetDeferral(&pending.deferral);
 				wil::unique_cotaskmem_string uri;
 				args->get_Uri(&uri);
-				if (!_popupRequestedCallback(requestId, uri.get()))
+				PhotinoPopupFeatures features = {};
+				wil::com_ptr<ICoreWebView2WindowFeatures> windowFeatures;
+				if (SUCCEEDED(args->get_WindowFeatures(&windowFeatures)) && windowFeatures)
+				{
+					BOOL has = FALSE;
+					UINT32 value = 0;
+					windowFeatures->get_HasPosition(&has);
+					features.HasPosition = has != FALSE;
+					windowFeatures->get_HasSize(&has);
+					features.HasSize = has != FALSE;
+					windowFeatures->get_Left(&value); features.Left = (int)value;
+					windowFeatures->get_Top(&value); features.Top = (int)value;
+					windowFeatures->get_Width(&value); features.Width = (int)value;
+					windowFeatures->get_Height(&value); features.Height = (int)value;
+				}
+				if (!_popupRequestedCallback(requestId, uri.get(), &features))
 					FinishPopupRequest(requestId, nullptr);
+				else if (_pendingPopups.count(requestId) != 0 && _popupRequestTimeoutMilliseconds > 0)
+					SetTimer(_hWnd, PHOTINO_POPUP_REQUEST_TIMER_BASE + requestId, (UINT)_popupRequestTimeoutMilliseconds, nullptr);
 				return S_OK;
 			}).Get(), &newWindowRequestedToken);
 	}
