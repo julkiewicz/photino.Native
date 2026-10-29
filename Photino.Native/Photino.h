@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include <wil/com.h>
 #include <WebView2.h>
+#include <dcomp.h>
 typedef wchar_t *AutoString;
 class WinToastHandler;
 #else
@@ -116,6 +117,61 @@ struct PhotinoInitParams
 	int Size;
 };
 
+#ifdef _WIN32
+// Windows-only hosting options, passed with Photino_ctorWithOptions_win32. A zeroed struct (with Size set) gives
+// Photino's usual behavior; Photino_ctor is unchanged.
+
+// One mouse or key message the composition mode routes to the host instead of the page. X and Y are in client
+// pixels (also for the wheel, whose LParam is in screen pixels); WParam and LParam are the window message's own.
+struct PhotinoHostInput
+{
+	unsigned int Message;
+	int X;
+	int Y;
+	unsigned long long WParam;
+	long long LParam;
+};
+
+// Where a composition surface sits in the window's client area, in physical pixels.
+struct PhotinoSurfaceBounds
+{
+	HANDLE Surface;
+	int X;
+	int Y;
+	int Width;
+	int Height;
+};
+
+typedef void (*HostInputCallback)(const PhotinoHostInput *input);
+// The page called window.open. Return true to host it: the host then creates a window (now or later, on this
+// thread) with PhotinoWindowsOptions.PopupOpener set to this instance and PopupRequestId to requestId. Return false
+// to refuse it (window.open returns null in the page).
+typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri);
+
+struct PhotinoWindowsOptions
+{
+	// Create the window without showing it (the page still loads and runs).
+	bool StartHidden;
+	// Host WebView2 through its composition controller in a DirectComposition tree: the page is a transparent
+	// visual above a host layer that Photino_AddCompositionSurface_win32 fills; mouse input is routed by hit regions.
+	bool CompositionHosting;
+	// Composition mode: after the window's size or DPI changes, a press waits up to this long for the page to
+	// publish its new hit regions before it is routed. 0 means the default (100 ms), a negative value turns it off.
+	int HitRegionHoldMilliseconds;
+	// Composition mode: receives the mouse input outside the page's hit regions and key input while the window
+	// (not the page) has focus. May be null.
+	HostInputCallback HostInputHandler;
+	// Called when the page calls window.open. Null keeps WebView2's own behavior.
+	PopupRequestedCallback PopupRequestedHandler;
+	// Set both to make this window the popup a PopupRequestedCallback accepted: it shares the opener's WebView2
+	// environment and becomes the page's new window (no StartUrl or StartString needed).
+	Photino *PopupOpener;
+	int PopupRequestId;
+
+	int Size;
+};
+#endif
+
 class Photino
 {
 private:
@@ -168,7 +224,51 @@ private:
 	bool InstallWebView2();
 	void AttachWebView();
 	bool ToWide(PhotinoInitParams* params);
-	
+
+	// Windows hosting options (PhotinoWindowsOptions); every one off unless asked for.
+	enum class InputTarget { None, Page, Host };
+	struct HeldInput { UINT message; WPARAM wParam; LPARAM lParam; };
+	struct PendingPopup
+	{
+		wil::com_ptr<ICoreWebView2NewWindowRequestedEventArgs> args;
+		wil::com_ptr<ICoreWebView2Deferral> deferral;
+	};
+	bool _startHidden = false;
+	bool _compositionHosting = false;
+	int _hitRegionHoldMilliseconds = 0;
+	HostInputCallback _hostInputCallback = nullptr;
+	PopupRequestedCallback _popupRequestedCallback = nullptr;
+	HWND _popupOpenerHwnd = nullptr;
+	int _popupRequestId = 0;
+	int _nextPopupRequestId = 0;
+	std::map<int, PendingPopup> _pendingPopups;
+	wil::com_ptr<ICoreWebView2CompositionController> _compositionController;
+	wil::com_ptr<IDCompositionDesktopDevice> _dcompDevice;
+	wil::com_ptr<IDCompositionTarget> _dcompTarget;
+	wil::com_ptr<IDCompositionVisual2> _dcompRootVisual;
+	wil::com_ptr<IDCompositionVisual2> _dcompHostVisual;
+	wil::com_ptr<IDCompositionVisual2> _dcompWebVisual;
+	std::map<HANDLE, wil::com_ptr<IDCompositionVisual2>> _compositionSurfaces;
+	std::vector<RECT> _hitRegions;
+	bool _hitRegionsArePage = true;
+	bool _hitRegionsStale = false;
+	ULONGLONG _hitRegionsStaleSince = 0;
+	std::vector<HeldInput> _heldInput;
+	InputTarget _inputOwner = InputTarget::None;
+	InputTarget _hoverTarget = InputTarget::None;
+	bool _trackingMouseLeave = false;
+	SIZE _lastClientSize = {};
+	void CreateWebViewController(ICoreWebView2Environment *env);
+	HRESULT OnWebViewControllerCreated(HRESULT result, ICoreWebView2Controller *controller);
+	HRESULT BuildCompositionTree();
+	bool TakeHitRegionMessage(LPCWSTR message);
+	void MarkHitRegionsStale();
+	void FlushHeldInput();
+	InputTarget TargetAt(POINT point);
+	void RouteMouse(UINT message, WPARAM wParam, LPARAM lParam);
+	void SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam);
+	void FinishPopupRequest(int requestId, ICoreWebView2 *newWindow);
+
 #elif __linux__
 	// GtkWidget* _window;
 	GtkWidget *_webview;
@@ -217,6 +317,14 @@ public:
 	void GetNotificationsEnabled(bool* enabled);
 	AutoString ToUTF16String(AutoString source);
 	AutoString ToUTF8String(AutoString source);
+	Photino(PhotinoInitParams *initParams, const PhotinoWindowsOptions *options);
+	bool HandleCompositionMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result);
+	void OnWindowDestroyed();
+	void GetCompositionHostingEnabled(bool *enabled);
+	HANDLE AddCompositionSurface(int x, int y, int width, int height);
+	void SetCompositionSurfaceBounds(const PhotinoSurfaceBounds *bounds, int count);
+	void RemoveCompositionSurface(HANDLE surface);
+	void SetHitRegions(const int *rects, int count, bool regionsArePage);
 	int _minWidth;
 	int _minHeight;
 	int _maxWidth;

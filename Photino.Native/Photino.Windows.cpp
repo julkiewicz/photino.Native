@@ -75,7 +75,11 @@ void Photino::Register(HINSTANCE hInstance)
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
 }
 
-Photino::Photino(PhotinoInitParams* initParams)
+Photino::Photino(PhotinoInitParams* initParams) : Photino(initParams, nullptr)
+{
+}
+
+Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* options)
 {
 	//wchar_t msg[50];
 	//swprintf(msg, 50, L"Size: %i", initParams->Size);
@@ -91,6 +95,27 @@ Photino::Photino(PhotinoInitParams* initParams)
 		swprintf(msg, 200, L"Initial parameters passed are %i bytes, but expected %I64i bytes.", initParams->Size, sizeof(PhotinoInitParams));
 		MessageBox(nullptr, msg, L"Native Initialization Failed", MB_OK);
 		exit(0);
+	}
+
+	if (options != nullptr)
+	{
+		if (options->Size != sizeof(PhotinoWindowsOptions))
+		{
+			wchar_t msg[200];
+			swprintf(msg, 200, L"Windows options passed are %i bytes, but expected %I64i bytes.", options->Size, sizeof(PhotinoWindowsOptions));
+			MessageBox(nullptr, msg, L"Native Initialization Failed", MB_OK);
+			exit(0);
+		}
+		_startHidden = options->StartHidden;
+		_compositionHosting = options->CompositionHosting;
+		_hitRegionHoldMilliseconds = options->HitRegionHoldMilliseconds == 0 ? 100 : options->HitRegionHoldMilliseconds;
+		_hostInputCallback = options->HostInputHandler;
+		_popupRequestedCallback = options->PopupRequestedHandler;
+		if (options->PopupOpener != nullptr)
+		{
+			_popupOpenerHwnd = options->PopupOpener->getHwnd();
+			_popupRequestId = options->PopupRequestId;
+		}
 	}
 
 	_windowTitle = new wchar_t[256];
@@ -328,6 +353,14 @@ HWND Photino::getHwnd()
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+	auto composed = hwndToPhotino.find(hwnd);
+	if (composed != hwndToPhotino.end() && composed->second != nullptr)
+	{
+		LRESULT result = 0;
+		if (composed->second->HandleCompositionMessage(uMsg, wParam, lParam, &result))
+			return result;
+	}
+
 	switch (uMsg)
 	{
 	case WM_CREATE: 
@@ -408,6 +441,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	{
 		// Only terminate the message loop if the window being closed is the one that
 		// started the message loop
+		Photino* destroyed = hwndToPhotino[hwnd];
+		if (destroyed)
+			destroyed->OnWindowDestroyed();
 		hwndToPhotino.erase(hwnd);
 		if (hwnd == messageLoopRootWindowHandle)
 			PostQuitMessage(0);
@@ -978,6 +1014,18 @@ AutoString Photino::ToUTF16String(AutoString source)
 
 void Photino::AttachWebView()
 {
+	if (_popupOpenerHwnd != nullptr)
+	{
+		// A popup lives in its opener's environment, so the page can script it and it shares the page's processes.
+		auto opener = hwndToPhotino.find(_popupOpenerHwnd);
+		if (opener != hwndToPhotino.end() && opener->second->_webviewEnvironment)
+		{
+			_webviewEnvironment = opener->second->_webviewEnvironment;
+			CreateWebViewController(_webviewEnvironment.get());
+		}
+		return;
+	}
+
 	size_t runtimePathLen = wcsnlen(_webview2RuntimePath, _countof(_webview2RuntimePath));
 	PCWSTR runtimePath = runtimePathLen > 0 ? &_webview2RuntimePath[0] : nullptr;
 
@@ -1018,112 +1066,7 @@ void Photino::AttachWebView()
 				HRESULT envResult = env->QueryInterface(&_webviewEnvironment);
 				if (envResult != S_OK) { return envResult; }
 
-				env->CreateCoreWebView2Controller(_hWnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-					[&](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
-
-						if (result != S_OK) { return result; }
-
-						HRESULT envResult = controller->QueryInterface(&_webviewController);
-						if (envResult != S_OK) { return envResult; }
-						_webviewController->get_CoreWebView2(&_webviewWindow);
-
-						ICoreWebView2Settings* Settings;
-						_webviewWindow->get_Settings(&Settings);
-						Settings->put_AreHostObjectsAllowed(TRUE);
-						Settings->put_IsScriptEnabled(TRUE);
-						Settings->put_AreDefaultScriptDialogsEnabled(TRUE);
-						Settings->put_IsWebMessageEnabled(TRUE);
-
-						EventRegistrationToken webMessageToken;
-						_webviewWindow->AddScriptToExecuteOnDocumentCreated(L"window.external = { sendMessage: function(message) { window.chrome.webview.postMessage(message); }, receiveMessage: function(callback) { window.chrome.webview.addEventListener(\'message\', function(e) { callback(e.data); }); } };", nullptr);
-						_webviewWindow->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-							[&](ICoreWebView2* webview, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-								wil::unique_cotaskmem_string message;
-								args->TryGetWebMessageAsString(&message);
-								_webMessageReceivedCallback(message.get());
-								return S_OK;
-							}).Get(), &webMessageToken);
-
-						EventRegistrationToken webResourceRequestedToken;
-						_webviewWindow->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-						_webviewWindow->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-							[&](ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args)
-							{
-								ICoreWebView2WebResourceRequest* req;
-								args->get_Request(&req);
-
-								wil::unique_cotaskmem_string uri;
-								req->get_Uri(&uri);
-								std::wstring uriString = uri.get();
-								size_t colonPos = uriString.find(L':', 0);
-								if (colonPos > 0)
-								{
-									std::wstring scheme = uriString.substr(0, colonPos);
-									std::vector<wchar_t*>::iterator it = std::find(_customSchemeNames.begin(), _customSchemeNames.end(), scheme);
-
-									if (it != _customSchemeNames.end() && _customSchemeCallback != NULL)
-									{
-										int numBytes;
-										AutoString contentType;
-										wil::unique_cotaskmem dotNetResponse(_customSchemeCallback((AutoString)uriString.c_str(), &numBytes, &contentType));
-
-										if (dotNetResponse != nullptr && contentType != nullptr)
-										{
-											std::wstring contentTypeWS = contentType;
-
-											IStream* dataStream = SHCreateMemStream((BYTE*)dotNetResponse.get(), numBytes);
-											wil::com_ptr<ICoreWebView2WebResourceResponse> response;
-											_webviewEnvironment->CreateWebResourceResponse(
-												dataStream, 200, L"OK", (L"Content-Type: " + contentTypeWS).c_str(),
-												&response);
-											args->put_Response(response.get());
-										}
-									}
-								}
-
-								return S_OK;
-							}
-						).Get(), &webResourceRequestedToken);
-
-						EventRegistrationToken permissionRequestedToken;
-						_webviewWindow->add_PermissionRequested(
-							Callback<ICoreWebView2PermissionRequestedEventHandler>(
-								[&](ICoreWebView2* sender, ICoreWebView2PermissionRequestedEventArgs* args)	-> HRESULT {
-									if (_grantBrowserPermissions)
-										args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
-									return S_OK;
-								})
-							.Get(),
-									&permissionRequestedToken);
-
-						if (_startUrl != NULL)
-							NavigateToUrl(_startUrl);
-						else if (_startString != NULL)
-							NavigateToString(_startString);
-						else
-						{
-							MessageBox(nullptr, L"Neither StartUrl nor StartString was specified", L"Native Initialization Failed", MB_OK);
-							exit(0);
-						}
-
-						if (_contextMenuEnabled == false)
-							SetContextMenuEnabled(false);
-
-						if (_devToolsEnabled == false)
-							SetDevToolsEnabled(false);
-
-						if (_transparentEnabled == true)
-							SetTransparentEnabled(true);
-
-						if (_zoom != 100)
-							SetZoom(_zoom);
-
-						RefitContent();
-
-						FocusWebView2();
-
-						return S_OK;
-					}).Get());
+				CreateWebViewController(env);
 				return S_OK;
 			}).Get());
 
@@ -1133,6 +1076,220 @@ void Photino::AttachWebView()
 		LPCTSTR errMsg = err.ErrorMessage();
 		MessageBox(_hWnd, errMsg, L"Error instantiating webview", MB_OK);
 	}
+}
+
+void Photino::CreateWebViewController(ICoreWebView2Environment* env)
+{
+	if (_compositionHosting)
+	{
+		wil::com_ptr<ICoreWebView2Environment3> env3;
+		if (SUCCEEDED(env->QueryInterface(IID_PPV_ARGS(&env3))))
+		{
+			env3->CreateCoreWebView2CompositionController(_hWnd, Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
+				[this](HRESULT result, ICoreWebView2CompositionController* compositionController) -> HRESULT {
+					wil::com_ptr<ICoreWebView2Controller> controller;
+					if (result == S_OK && compositionController != nullptr)
+					{
+						_compositionController = compositionController;
+						result = compositionController->QueryInterface(IID_PPV_ARGS(&controller));
+						if (result == S_OK)
+							result = BuildCompositionTree();
+					}
+					return OnWebViewControllerCreated(result, controller.get());
+				}).Get());
+			return;
+		}
+		_compositionHosting = false;	// the runtime has no composition controller: host it the usual way
+	}
+
+	env->CreateCoreWebView2Controller(_hWnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+		[this](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+			return OnWebViewControllerCreated(result, controller);
+		}).Get());
+}
+
+HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Controller* controller)
+{
+	Photino* opener = nullptr;
+	if (_popupOpenerHwnd != nullptr)
+	{
+		auto found = hwndToPhotino.find(_popupOpenerHwnd);
+		if (found != hwndToPhotino.end())
+			opener = found->second;
+	}
+
+	if (result != S_OK || controller == nullptr)
+	{
+		if (opener)
+			opener->FinishPopupRequest(_popupRequestId, nullptr);
+		return result;
+	}
+
+	HRESULT envResult = controller->QueryInterface(&_webviewController);
+	if (envResult != S_OK) { return envResult; }
+	_webviewController->get_CoreWebView2(&_webviewWindow);
+
+	if (_startHidden)
+		_webviewController->put_IsVisible(TRUE);	// the page lays out and renders while its window is hidden
+
+	if (_compositionHosting)
+	{
+		// The page is a visual above the host's surfaces: let them show through where the page draws nothing.
+		wil::com_ptr<ICoreWebView2Controller2> controller2 = _webviewController.try_query<ICoreWebView2Controller2>();
+		if (controller2)
+			controller2->put_DefaultBackgroundColor({ 0, 0, 0, 0 });
+
+		// window.photino.setHitRegions(rects, mode): rects in CSS pixels ({left, top, width, height}, e.g. DOMRects),
+		// mode 'page' (the default: input inside the rects goes to the page) or 'host' (inside goes to the host).
+		_webviewWindow->AddScriptToExecuteOnDocumentCreated(L"(function(){var P='__photino_hit_regions__:';window.photino=window.photino||{};window.photino.setHitRegions=function(rects,mode){var d=window.devicePixelRatio||1,o=[];for(var i=0;rects&&i<rects.length;i++){var r=rects[i],l=Math.floor(r.left*d),t=Math.floor(r.top*d),x=Math.ceil((r.left+r.width)*d),y=Math.ceil((r.top+r.height)*d);if(x>l&&y>t)o.push(l+','+t+','+(x-l)+','+(y-t));}window.chrome.webview.postMessage(P+(mode==='host'?'host':'page')+':'+o.join(';'));};})();", nullptr);
+
+		EventRegistrationToken cursorChangedToken;
+		_compositionController->add_CursorChanged(Callback<ICoreWebView2CursorChangedEventHandler>(
+			[this](ICoreWebView2CompositionController* sender, IUnknown* args) -> HRESULT {
+				// Only while the real cursor is over this window and the page owns that point.
+				POINT cursor;
+				if (GetCursorPos(&cursor) && WindowFromPoint(cursor) == _hWnd)
+				{
+					ScreenToClient(_hWnd, &cursor);
+					InputTarget target = _inputOwner != InputTarget::None ? _inputOwner : TargetAt(cursor);
+					HCURSOR pageCursor = nullptr;
+					if (target == InputTarget::Page && SUCCEEDED(sender->get_Cursor(&pageCursor)))
+						SetCursor(pageCursor);
+				}
+				return S_OK;
+			}).Get(), &cursorChangedToken);
+	}
+
+	ICoreWebView2Settings* Settings;
+	_webviewWindow->get_Settings(&Settings);
+	Settings->put_AreHostObjectsAllowed(TRUE);
+	Settings->put_IsScriptEnabled(TRUE);
+	Settings->put_AreDefaultScriptDialogsEnabled(TRUE);
+	Settings->put_IsWebMessageEnabled(TRUE);
+
+	EventRegistrationToken webMessageToken;
+	_webviewWindow->AddScriptToExecuteOnDocumentCreated(L"window.external = { sendMessage: function(message) { window.chrome.webview.postMessage(message); }, receiveMessage: function(callback) { window.chrome.webview.addEventListener(\'message\', function(e) { callback(e.data); }); } };", nullptr);
+	_webviewWindow->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+		[&](ICoreWebView2* webview, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+			wil::unique_cotaskmem_string message;
+			args->TryGetWebMessageAsString(&message);
+			if (_compositionHosting && TakeHitRegionMessage(message.get()))
+				return S_OK;
+			_webMessageReceivedCallback(message.get());
+			return S_OK;
+		}).Get(), &webMessageToken);
+
+	EventRegistrationToken webResourceRequestedToken;
+	_webviewWindow->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+	_webviewWindow->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+		[&](ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args)
+		{
+			ICoreWebView2WebResourceRequest* req;
+			args->get_Request(&req);
+
+			wil::unique_cotaskmem_string uri;
+			req->get_Uri(&uri);
+			std::wstring uriString = uri.get();
+			size_t colonPos = uriString.find(L':', 0);
+			if (colonPos > 0)
+			{
+				std::wstring scheme = uriString.substr(0, colonPos);
+				std::vector<wchar_t*>::iterator it = std::find(_customSchemeNames.begin(), _customSchemeNames.end(), scheme);
+
+				if (it != _customSchemeNames.end() && _customSchemeCallback != NULL)
+				{
+					int numBytes;
+					AutoString contentType;
+					wil::unique_cotaskmem dotNetResponse(_customSchemeCallback((AutoString)uriString.c_str(), &numBytes, &contentType));
+
+					if (dotNetResponse != nullptr && contentType != nullptr)
+					{
+						std::wstring contentTypeWS = contentType;
+
+						IStream* dataStream = SHCreateMemStream((BYTE*)dotNetResponse.get(), numBytes);
+						wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+						_webviewEnvironment->CreateWebResourceResponse(
+							dataStream, 200, L"OK", (L"Content-Type: " + contentTypeWS).c_str(),
+							&response);
+						args->put_Response(response.get());
+					}
+				}
+			}
+
+			return S_OK;
+		}
+	).Get(), &webResourceRequestedToken);
+
+	EventRegistrationToken permissionRequestedToken;
+	_webviewWindow->add_PermissionRequested(
+		Callback<ICoreWebView2PermissionRequestedEventHandler>(
+			[&](ICoreWebView2* sender, ICoreWebView2PermissionRequestedEventArgs* args)	-> HRESULT {
+				if (_grantBrowserPermissions)
+					args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+				return S_OK;
+			})
+		.Get(),
+				&permissionRequestedToken);
+
+	if (_popupRequestedCallback != nullptr)
+	{
+		EventRegistrationToken newWindowRequestedToken;
+		_webviewWindow->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+			[this](ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+				int requestId = ++_nextPopupRequestId;
+				PendingPopup& pending = _pendingPopups[requestId];
+				pending.args = args;
+				args->GetDeferral(&pending.deferral);
+				wil::unique_cotaskmem_string uri;
+				args->get_Uri(&uri);
+				if (!_popupRequestedCallback(requestId, uri.get()))
+					FinishPopupRequest(requestId, nullptr);
+				return S_OK;
+			}).Get(), &newWindowRequestedToken);
+	}
+
+	if (_popupOpenerHwnd != nullptr)
+	{
+		// A popup: the page closing it (window.close) closes this window the usual way (the closing callback first).
+		EventRegistrationToken windowCloseRequestedToken;
+		_webviewWindow->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+			[this](ICoreWebView2* sender, IUnknown* args) -> HRESULT {
+				Close();
+				return S_OK;
+			}).Get(), &windowCloseRequestedToken);
+
+		// The opener's page navigates it; nothing to load here.
+		if (opener)
+			opener->FinishPopupRequest(_popupRequestId, _webviewWindow.get());
+	}
+	else if (_startUrl != NULL)
+		NavigateToUrl(_startUrl);
+	else if (_startString != NULL)
+		NavigateToString(_startString);
+	else
+	{
+		MessageBox(nullptr, L"Neither StartUrl nor StartString was specified", L"Native Initialization Failed", MB_OK);
+		exit(0);
+	}
+
+	if (_contextMenuEnabled == false)
+		SetContextMenuEnabled(false);
+
+	if (_devToolsEnabled == false)
+		SetDevToolsEnabled(false);
+
+	if (_transparentEnabled == true)
+		SetTransparentEnabled(true);
+
+	if (_zoom != 100)
+		SetZoom(_zoom);
+
+	RefitContent();
+
+	if (!_startHidden)	// a hidden window never takes the keyboard
+		FocusWebView2();
+
+	return S_OK;
 }
 
 
@@ -1257,7 +1414,7 @@ void Photino::SetWebView2RuntimePath(AutoString pathToWebView2)
 
 void Photino::Show(bool isAlreadyShown)
 {
-	if (!isAlreadyShown)
+	if (!isAlreadyShown && !_startHidden)
 		ShowWindow(_hWnd, SW_SHOWDEFAULT);	//causes maximized and minimized to not work
 
 	UpdateWindow(_hWnd);

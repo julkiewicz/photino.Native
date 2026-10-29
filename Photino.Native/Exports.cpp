@@ -29,6 +29,36 @@ extern "C"
 	{
 		instance->GetNotificationsEnabled(disabled);
 	}
+
+	EXPORTED Photino* Photino_ctorWithOptions_win32(PhotinoInitParams* initParams, PhotinoWindowsOptions* options)
+	{
+		return new Photino(initParams, options);
+	}
+
+	EXPORTED void Photino_GetCompositionHostingEnabled_win32(Photino* instance, bool* enabled)
+	{
+		instance->GetCompositionHostingEnabled(enabled);
+	}
+
+	EXPORTED HANDLE Photino_AddCompositionSurface_win32(Photino* instance, int x, int y, int width, int height)
+	{
+		return instance->AddCompositionSurface(x, y, width, height);
+	}
+
+	EXPORTED void Photino_SetCompositionSurfaceBounds_win32(Photino* instance, PhotinoSurfaceBounds* bounds, int count)
+	{
+		instance->SetCompositionSurfaceBounds(bounds, count);
+	}
+
+	EXPORTED void Photino_RemoveCompositionSurface_win32(Photino* instance, HANDLE surface)
+	{
+		instance->RemoveCompositionSurface(surface);
+	}
+
+	EXPORTED void Photino_SetHitRegions_win32(Photino* instance, int* rects, int count, bool regionsArePage)
+	{
+		instance->SetHitRegions(rects, count, regionsArePage);
+	}
 #elif __APPLE__
 	EXPORTED void Photino_register_mac()
 	{

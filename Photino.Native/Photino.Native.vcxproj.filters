@@ -21,6 +21,9 @@
     <ClCompile Include="Photino.Windows.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Photino.Windows.Composition.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Photino.Linux.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
