@@ -95,7 +95,12 @@ int wmain(int argc, wchar_t** argv)
 	DWORD code = 4;
 	if (started)
 	{
-		WaitForSingleObject(pi.hProcess, 300000);
+		if (WaitForSingleObject(pi.hProcess, 300000) == WAIT_TIMEOUT)
+		{
+			printf("timed out after 300 s: terminated\n");
+			TerminateProcess(pi.hProcess, 5);
+			WaitForSingleObject(pi.hProcess, 10000);
+		}
 		GetExitCodeProcess(pi.hProcess, &code);
 		CloseHandle(pi.hProcess);
 		CloseHandle(pi.hThread);

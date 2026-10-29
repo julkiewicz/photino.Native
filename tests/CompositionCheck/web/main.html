@@ -30,8 +30,10 @@
   document.getElementById('button').addEventListener('click', (e) => { lastClick = e.clientX + ',' + e.clientY; });
 
   // The page's hit region: the panel, republished after every layout change of the viewport.
+  let frozen = false, lastButton = '';
+  document.addEventListener('pointerdown', (e) => { lastButton = String(e.button); }, true);
   function publish() {
-    if (!(window.photino && window.photino.setHitRegions)) return;
+    if (frozen || !(window.photino && window.photino.setHitRegions)) return;
     const r = document.getElementById('panel').getBoundingClientRect();
     window.photino.setHitRegions([r]);
     const d = window.devicePixelRatio;
@@ -48,6 +50,7 @@
     const parts = Object.entries(counts).map(([k, v]) => k + '=' + v);
     parts.push('scrollTop=' + Math.round(list.scrollTop));
     parts.push('lastClick=' + lastClick);
+    parts.push('lastButton=' + lastButton);
     parts.push('lastWheel=' + lastWheel);
     parts.push('bodyBackground=' + getComputedStyle(document.body).backgroundColor);
     parts.push('htmlBackground=' + getComputedStyle(document.documentElement).backgroundColor);
@@ -90,6 +93,7 @@
     if (command === 'report') report();
     else if (command === 'reset') { for (const k in counts) counts[k] = 0; lastClick = ''; list.scrollTop = 0; send('reset-done'); }
     else if (command === 'publish') publish();
+    else if (command === 'freeze') { frozen = argument === 'on'; send('freeze-done'); }
     else if (command === 'echo') send('echo:' + argument);
     else if (command === 'send-prefixed') send('__photino_hit_regions__:page:1,2,3,4');
     else if (command === 'open-popup') openPopup(argument);
