@@ -17,7 +17,7 @@ if (-not $msbuild) { throw 'No MSBuild with the C++ tools found.' }
 
 $toolset = @()
 if ($PlatformToolset) { $toolset = @("-p:PlatformToolset=$PlatformToolset") }
-& $msbuild $project -t:restore -p:RestorePackagesConfig=true -nologo -v:minimal
+& $msbuild $project -t:restore -p:RestorePackagesConfig=true "-p:Configuration=$Configuration" -p:Platform=x64 -nologo -v:minimal
 if ($LASTEXITCODE -ne 0) { throw 'Restore failed.' }
 & $msbuild $project "-p:Configuration=$Configuration" -p:Platform=x64 @toolset -m -nologo -v:minimal
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
