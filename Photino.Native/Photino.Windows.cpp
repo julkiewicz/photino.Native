@@ -315,9 +315,9 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 	if (initParams->CenterOnInitialize)
 		Photino::Center();
 
-	if (_startHidden)
+	if (_hasWindowsOptions)
 	{
-		// Kept for Photino_Show_win32: showing it now would show (and activate) the window.
+		// Applied by the window's first show (now, or Photino_Show_win32 for a hidden one).
 		if (initParams->Minimized) _pendingShowCommand = SW_SHOWMINNOACTIVE;
 		if (initParams->Maximized) _pendingShowCommand = SW_SHOWMAXIMIZED;
 	}
@@ -348,7 +348,7 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 
 	_dialog = new PhotinoDialog(this);
 
-	bool isAlreadyShown = !_startHidden && (initParams->Minimized || initParams->Maximized);
+	bool isAlreadyShown = !_hasWindowsOptions && (initParams->Minimized || initParams->Maximized);
 	Photino::Show(isAlreadyShown);
 }
 
@@ -742,6 +742,8 @@ void Photino::NavigateToUrl(AutoString url)
 
 void Photino::Restore()
 {
+	if (ShowStateWithoutActivating(SW_RESTORE))
+		return;
 	ShowWindow(_hWnd, SW_RESTORE);
 }
 
@@ -813,6 +815,8 @@ void Photino::SetIconFile(AutoString filename)
 
 void Photino::SetMinimized(bool minimized)
 {
+	if (ShowStateWithoutActivating(minimized ? SW_MINIMIZE : SW_NORMAL))
+		return;
 	if (minimized)
 		ShowWindow(_hWnd, SW_MINIMIZE);
 	else
@@ -834,6 +838,8 @@ void Photino::SetMinSize(int width, int height)
 
 void Photino::SetMaximized(bool maximized)
 {
+	if (ShowStateWithoutActivating(maximized ? SW_MAXIMIZE : SW_NORMAL))
+		return;
 	if (maximized)
 		ShowWindow(_hWnd, SW_MAXIMIZE);
 	else
@@ -1306,9 +1312,10 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 				return S_OK;
 			}).Get(), &windowCloseRequestedToken);
 
-		// The opener's page navigates it; nothing to load here.
-		if (opener)
-			opener->FinishPopupRequest(_popupRequestId, _webviewWindow.get());
+		// The opener's page navigates it; nothing to load here. If the request was refused meanwhile (the host, or
+		// its timeout), this window has no page: close it.
+		if (!opener || !opener->FinishPopupRequest(_popupRequestId, _webviewWindow.get()))
+			Close();
 	}
 	else if (_startUrl != NULL)
 		NavigateToUrl(_startUrl);
@@ -1463,7 +1470,7 @@ void Photino::SetWebView2RuntimePath(AutoString pathToWebView2)
 void Photino::Show(bool isAlreadyShown)
 {
 	if (!isAlreadyShown && !_startHidden)
-		ShowWindow(_hWnd, SW_SHOWDEFAULT);	//causes maximized and minimized to not work
+		ShowWindow(_hWnd, _pendingShowCommand != 0 ? _pendingShowCommand : SW_SHOWDEFAULT);	//causes maximized and minimized to not work
 
 	UpdateWindow(_hWnd);
 

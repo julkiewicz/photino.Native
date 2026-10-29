@@ -39,6 +39,9 @@ extern "C"
 	__declspec(dllimport) void Photino_RemoveCompositionSurface_win32(Photino* instance, HANDLE surface);
 	__declspec(dllimport) void Photino_SetHitRegions_win32(Photino* instance, int* rects, int count, bool regionsArePage);
 	__declspec(dllimport) void Photino_RefusePopupRequest_win32(Photino* opener, int requestId);
+	__declspec(dllimport) void Photino_SetMaximized(Photino* instance, bool maximized);
+	__declspec(dllimport) void Photino_SetMinimized(Photino* instance, bool minimized);
+	__declspec(dllimport) void Photino_Restore(Photino* instance);
 	__declspec(dllimport) Photino* Photino_ctor(PhotinoInitParams* initParams);
 }
 
@@ -391,7 +394,16 @@ static void DriveDefault()
 	if (gLegacy)
 		Check(IsWindowVisible(gMainHwnd), "legacy: Photino_ctor shows its window, as before (on the check's own desktop)");
 	else
+	{
 		Check(!IsWindowVisible(gMainHwnd), "default: window never shown");
+		OnUi(gMain, [] {
+			Photino_SetMaximized(gMain, true);
+			Photino_SetMinimized(gMain, true);
+			Photino_SetMaximized(gMain, false);
+			Photino_Restore(gMain);
+		});
+		Check(!IsWindowVisible(gMainHwnd), "default: maximize, minimize and restore keep a hidden window hidden");
+	}
 	SendToPage("echo:hello");
 	Check(WaitFor(L"echo:") == L"echo:hello", "default: web message round trip");
 	SendToPage("send-prefixed");
@@ -676,6 +688,25 @@ static void DrivePopups()
 	int pending = lastRequest();
 	OnUi(gMain, [&] { Photino_RefusePopupRequest_win32(gMain, pending); });
 	Check(WaitFor(L"popup-") == L"popup-null:p4", tag + "an accepted request the host refuses later: window.open returns null");
+
+	// The host creates the window for that request after all: it has no page, so it closes itself.
+	int closingsBefore = gPopupClosings;
+	HWND lateHwnd = nullptr;
+	OnUi(gMain, [&] {
+		PhotinoInitParams params = BaseParams("late popup");
+		params.WebMessageReceivedHandler = (WebMessageReceivedCallback*)OnPopupMessage;
+		params.ClosingHandler = (ClosingCallback*)OnPopupClosing;
+		PhotinoWindowsOptions options = {};
+		options.Size = sizeof(PhotinoWindowsOptions);
+		options.StartHidden = true;
+		options.CompositionHosting = gComposition;
+		options.PopupOpener = gMain;
+		options.PopupRequestId = pending;
+		lateHwnd = Photino_getHwnd_win32(Photino_ctorWithOptions_win32(&params, &options));
+	});
+	for (int i = 0; i < 50 && IsWindow(lateHwnd); ++i)
+		Settle(100);
+	Check(!IsWindow(lateHwnd) && gPopupClosings == closingsBefore + 1, tag + "a window made for a refused request closes itself (closing callback first)");
 
 	ULONGLONG asked = GetTickCount64();
 	SendToPage("open-popup:p5");

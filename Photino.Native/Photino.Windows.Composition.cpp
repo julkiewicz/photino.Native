@@ -69,14 +69,44 @@ HRESULT Photino::AttachCompositionController()
 
 UINT Photino::PlacementFlags()
 {
-	// A window made with the Windows options, or a hidden one, is never activated by its own placement calls.
-	return (_hasWindowsOptions || !IsWindowVisible(_hWnd)) ? SWP_NOACTIVATE : 0;
+	// A window made with the Windows options is never activated by its own placement calls.
+	return _hasWindowsOptions ? SWP_NOACTIVATE : 0;
+}
+
+bool Photino::ShowStateWithoutActivating(int command)
+{
+	// Minimize, maximize and restore of a window made with the Windows options; false leaves the usual call to run
+	// (a window without the options, or one already in front, where activating changes nothing).
+	if (!_hasWindowsOptions)
+		return false;
+	if (!IsWindowVisible(_hWnd))
+	{
+		_pendingShowCommand = command == SW_MINIMIZE ? SW_SHOWMINNOACTIVE : command == SW_MAXIMIZE ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+		return true;
+	}
+	if (GetForegroundWindow() == _hWnd)
+		return false;
+	if (command == SW_MINIMIZE)
+		ShowWindow(_hWnd, SW_SHOWMINNOACTIVE);
+	else if (command == SW_MAXIMIZE)
+		_deferredMaximize = true;	// Windows has no non-activating maximize: done on the next activation
+	else
+		ShowWindow(_hWnd, SW_SHOWNOACTIVATE);
+	return true;
 }
 
 void Photino::ShowHidden()
 {
 	_startHidden = false;
-	ShowWindow(_hWnd, _pendingShowCommand);
+	ShowWindow(_hWnd, _pendingShowCommand != 0 ? _pendingShowCommand : SW_SHOW);
+}
+
+void Photino::LeaveIfCursorOutside()
+{
+	// A drag that ended outside the window: no leave will come from tracking (it is armed over the window only).
+	POINT cursor;
+	if (_inputOwner == InputTarget::None && GetCursorPos(&cursor) && WindowFromPoint(cursor) != _hWnd)
+		HandleMouseLeave();
 }
 
 void Photino::RefusePopupRequest(int requestId)
@@ -222,6 +252,17 @@ static int ButtonOf(UINT message, WPARAM wParam)
 	}
 }
 
+static int PhysicalButton(int logicalButton)
+{
+	// GetAsyncKeyState reads the physical buttons; a window message names the logical one.
+	if (GetSystemMetrics(SM_SWAPBUTTON))
+	{
+		if (logicalButton == VK_LBUTTON) return VK_RBUTTON;
+		if (logicalButton == VK_RBUTTON) return VK_LBUTTON;
+	}
+	return logicalButton;
+}
+
 void Photino::FlushHeldInput()
 {
 	KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
@@ -244,7 +285,7 @@ void Photino::FlushHeldInput()
 			bool released = false;
 			for (size_t j = i + 1; j < held.size() && !released; ++j)
 				released = IsMouseRelease(held[j].message) && ButtonOf(held[j].message, held[j].wParam) == button;
-			if (!released && (GetAsyncKeyState(button) & 0x8000) == 0)
+			if (!released && (GetAsyncKeyState(PhysicalButton(button)) & 0x8000) == 0)
 				continue;
 		}
 		RouteMouse(input.message, input.wParam, input.lParam);
@@ -284,6 +325,7 @@ void Photino::EndMouseOwner()
 	_ownerMouseKeys = 0;
 	if (GetCapture() == _hWnd)
 		ReleaseCapture();
+	LeaveIfCursorOutside();
 }
 
 void Photino::HandleMouseLeave()
@@ -388,6 +430,7 @@ void Photino::RouteMouse(UINT message, WPARAM wParam, LPARAM lParam)
 		_inputOwner = InputTarget::None;
 		if (GetCapture() == _hWnd)
 			ReleaseCapture();
+		LeaveIfCursorOutside();
 	}
 }
 
@@ -400,6 +443,12 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 		FinishPopupRequest((int)(wParam - PHOTINO_POPUP_REQUEST_TIMER_BASE), nullptr);
 		*result = 0;
 		return true;
+	}
+
+	if (message == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE && _deferredMaximize)
+	{
+		_deferredMaximize = false;
+		PostMessage(_hWnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);	// now in front: maximizing changes no activation
 	}
 
 	if (!_compositionController || !_dcompDevice)
@@ -487,10 +536,16 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 			return false;
 		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
 		// A late timer from an earlier hold must not end this one early.
-		if (_hitRegionsStale && !_heldInput.empty() && GetTickCount64() - _hitRegionsStaleSince >= (ULONGLONG)_hitRegionHoldMilliseconds)
+		if (_hitRegionsStale && !_heldInput.empty())
 		{
-			_hitRegionsStale = false;
-			FlushHeldInput();
+			ULONGLONG waited = GetTickCount64() - _hitRegionsStaleSince;
+			if (waited >= (ULONGLONG)_hitRegionHoldMilliseconds)
+			{
+				_hitRegionsStale = false;
+				FlushHeldInput();
+			}
+			else	// marked stale again during the hold (another resize): wait out the rest of the new hold
+				SetTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID, (UINT)(_hitRegionHoldMilliseconds - waited), nullptr);
 		}
 		*result = 0;
 		return true;
@@ -549,11 +604,11 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 	}
 }
 
-void Photino::FinishPopupRequest(int requestId, ICoreWebView2* newWindow)
+bool Photino::FinishPopupRequest(int requestId, ICoreWebView2* newWindow)
 {
 	auto found = _pendingPopups.find(requestId);
 	if (found == _pendingPopups.end())
-		return;
+		return false;
 	PendingPopup pending = found->second;
 	_pendingPopups.erase(found);
 
@@ -563,6 +618,7 @@ void Photino::FinishPopupRequest(int requestId, ICoreWebView2* newWindow)
 	pending.args->put_Handled(TRUE);	// handled with no new window: window.open returns null in the page
 	if (pending.deferral)
 		pending.deferral->Complete();
+	return true;
 }
 
 void Photino::OnWindowDestroyed()

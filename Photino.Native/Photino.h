@@ -162,15 +162,19 @@ struct PhotinoPopupFeatures
 typedef bool (*HostInputCallback)(const PhotinoHostInput *input);
 // The page called window.open. Return true to host it: the host then creates a window (on this thread) with
 // PhotinoWindowsOptions.PopupOpener set to this instance and PopupRequestId to requestId, or refuses it later with
-// Photino_RefusePopupRequest_win32. Return false to refuse it now (window.open returns null in the page).
+// Photino_RefusePopupRequest_win32. Return false to refuse it now (window.open returns null in the page). A popup
+// window whose request was refused (or timed out) before its page arrived closes itself (its closing callback runs).
 // The page's script is blocked until the request is fulfilled or refused, so fulfil it promptly; a request still
 // open after PopupRequestTimeoutMilliseconds is refused.
 typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri, const PhotinoPopupFeatures *features);
 
 struct PhotinoWindowsOptions
 {
-	// Create the window without showing it (the page still loads, lays out and runs; it never takes focus). Minimized
-	// and Maximized are kept for Photino_Show_win32, which shows it.
+	// Create the window without showing it (the page still loads, lays out and runs; it never takes focus).
+	// Photino_Show_win32 shows it. With these options, minimize, maximize and restore (at creation or later) never
+	// activate the window: on a hidden window they are kept for Photino_Show_win32; on a visible one behind others,
+	// minimize and restore apply without activating it, and maximize (Windows has no non-activating maximize) applies
+	// when the window is next activated.
 	bool StartHidden;
 	// Host WebView2 through its composition controller in a DirectComposition tree: the page is a transparent
 	// visual above a host layer that Photino_AddCompositionSurface_win32 fills (usable as soon as the window exists;
@@ -260,7 +264,8 @@ private:
 	};
 	bool _hasWindowsOptions = false;
 	bool _startHidden = false;
-	int _pendingShowCommand = SW_SHOW;
+	int _pendingShowCommand = 0;	// 0: none kept
+	bool _deferredMaximize = false;
 	int _popupRequestTimeoutMilliseconds = 0;
 	bool _hostHadFocus = false;
 	WPARAM _ownerMouseKeys = 0;
@@ -296,13 +301,15 @@ private:
 	void EndMouseOwner();
 	void HandleMouseLeave();
 	UINT PlacementFlags();
+	bool ShowStateWithoutActivating(int command);
+	void LeaveIfCursorOutside();
 	bool TakeHitRegionMessage(LPCWSTR message);
 	void MarkHitRegionsStale();
 	void FlushHeldInput();
 	InputTarget TargetAt(POINT point);
 	void RouteMouse(UINT message, WPARAM wParam, LPARAM lParam);
 	bool SendHostInput(UINT message, POINT point, WPARAM wParam, LPARAM lParam);
-	void FinishPopupRequest(int requestId, ICoreWebView2 *newWindow);
+	bool FinishPopupRequest(int requestId, ICoreWebView2 *newWindow);
 
 #elif __linux__
 	// GtkWidget* _window;
