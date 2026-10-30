@@ -88,6 +88,41 @@
     }, 50);
   }
 
+  // Navigations away from the page's origin, each of which the host cancels: the page must stay as it is.
+  function navAway() {
+    window.__planted = 'kept';
+    location.href = 'https://elsewhere.check/away.html';
+    setTimeout(() => {
+      const a = document.createElement('a');
+      a.href = 'https://elsewhere.check/link.html';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => send('nav-stayed:' + location.href + ';' + window.__planted), 1000);
+    }, 500);
+  }
+  function frameAway() {
+    const f = document.createElement('iframe');
+    f.src = 'https://elsewhere.check/frame.html';
+    document.body.appendChild(f);
+    setTimeout(() => {
+      let href;
+      try { href = String(f.contentWindow.location.href); } catch (e) { href = 'unreadable'; }
+      f.remove();
+      send('frame-stayed:' + href);
+    }, 1000);
+  }
+  function popupAway(name) {
+    const w = popups[name];
+    w.__planted = 'kept';
+    w.location.href = 'https://elsewhere.check/popup-away.html';
+    setTimeout(() => {
+      let state;
+      try { state = w.callMe() + ';' + w.__planted; } catch (e) { state = 'unreadable'; }
+      send('popup-stayed:' + name + ':' + state);
+    }, 1000);
+  }
+
   window.external.receiveMessage((message) => {
     const [command, argument] = [message.split(':')[0], message.slice(message.indexOf(':') + 1)];
     if (command === 'report') report();
@@ -99,6 +134,9 @@
     else if (command === 'open-popup') openPopup(argument);
     else if (command === 'close-popup') { popups[argument].close(); whenClosed(argument, popups[argument]); }
     else if (command === 'watch-popup') whenClosed(argument, popups[argument]);
+    else if (command === 'nav-away') navAway();
+    else if (command === 'frame-away') frameAway();
+    else if (command === 'popup-away') popupAway(argument);
   });
 
   window.addEventListener('load', () => send('ready'));

@@ -617,8 +617,20 @@ bool Photino::FinishPopupRequest(int requestId, ICoreWebView2* newWindow)
 	KillTimer(_hWnd, PHOTINO_POPUP_REQUEST_TIMER_BASE + requestId);
 	pending.args->put_Handled(TRUE);	// handled with no new window: window.open returns null in the page
 	if (pending.deferral)
-		pending.deferral->Complete();
+	{
+		if (SUCCEEDED(pending.deferral->Complete()))
+			++_popupDeferralsCompleted;
+		else
+			++_popupDeferralsFailed;
+	}
 	return true;
+}
+
+void Photino::GetPopupDeferralCounts(int* taken, int* completed, int* failed)
+{
+	*taken = _popupDeferralsTaken;
+	*completed = _popupDeferralsCompleted;
+	*failed = _popupDeferralsFailed;
 }
 
 void Photino::OnWindowDestroyed()

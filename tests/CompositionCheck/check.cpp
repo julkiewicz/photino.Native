@@ -11,6 +11,7 @@
 #include <dxgi1_3.h>
 #include <windowsx.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -39,6 +40,7 @@ extern "C"
 	__declspec(dllimport) void Photino_RemoveCompositionSurface_win32(Photino* instance, HANDLE surface);
 	__declspec(dllimport) void Photino_SetHitRegions_win32(Photino* instance, int* rects, int count, bool regionsArePage);
 	__declspec(dllimport) void Photino_RefusePopupRequest_win32(Photino* opener, int requestId);
+	__declspec(dllimport) void Photino_GetPopupDeferralCounts_win32(Photino* instance, int* taken, int* completed, int* failed);
 	__declspec(dllimport) void Photino_SetMaximized(Photino* instance, bool maximized);
 	__declspec(dllimport) void Photino_SetMinimized(Photino* instance, bool minimized);
 	__declspec(dllimport) void Photino_Restore(Photino* instance);
@@ -67,6 +69,11 @@ static HWND gMainHwnd = nullptr;
 static bool gComposition = false;
 static bool gNoHold = false;	// the control run: composition with the press hold turned off
 static std::string gUdf;
+static std::vector<std::wstring> gNavigations;	// every navigation the host was asked about
+static std::vector<std::wstring> gRefusedNavigations;
+static Photino* gOpener2 = nullptr;	// a second opener, closed with a request pending
+static bool gOpener2Ready = false;
+static int gOpener2Counts[3] = { -1, -1, -1 };	// its deferral counts as it was destroyed
 static int gFailures = 0;
 
 static void Check(bool ok, const std::string& name, const std::string& detail = "")
@@ -220,6 +227,42 @@ static bool OnPopupClosing()
 
 static bool OnMainClosing() { return false; }
 
+// The page's origin only: anything else is cancelled.
+static bool OnNavigationStarting(AutoString uri)
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	gNavigations.push_back(uri);
+	bool allowed = wcsncmp(uri, L"https://photino.check/", 22) == 0;
+	if (!allowed)
+		gRefusedNavigations.push_back(uri);
+	gChanged.notify_all();
+	return allowed;
+}
+
+static bool Refused(const std::wstring& uri)
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	return std::find(gRefusedNavigations.begin(), gRefusedNavigations.end(), uri) != gRefusedNavigations.end();
+}
+
+static void OnOpener2Message(AutoString message)
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	if (wcscmp(message, L"ready") == 0)
+		gOpener2Ready = true;
+	gChanged.notify_all();
+}
+
+static void OnOpener2Destroyed()
+{
+	int counts[3];
+	Photino_GetPopupDeferralCounts_win32(gOpener2, &counts[0], &counts[1], &counts[2]);
+	std::lock_guard<std::mutex> guard(gLock);
+	for (int i = 0; i < 3; ++i)
+		gOpener2Counts[i] = counts[i];
+	gChanged.notify_all();
+}
+
 static bool OnHostInput(const PhotinoHostInput* input)
 {
 	std::lock_guard<std::mutex> guard(gLock);
@@ -291,6 +334,8 @@ static bool OnPopupRequested(int requestId, AutoString uri, const PhotinoPopupFe
 	options.CompositionHosting = gComposition;
 	options.PopupOpener = gMain;
 	options.PopupRequestId = requestId;
+	options.NavigationStartingHandler = OnNavigationStarting;
+	options.BrowserAcceleratorKeysDisabled = true;
 	Photino* popup = Photino_ctorWithOptions_win32(&params, &options);
 	std::lock_guard<std::mutex> guard(gLock);
 	gPopupsByName[L"request" + std::to_wstring(requestId)] = popup;
@@ -622,6 +667,25 @@ static void DriveComposition()
 			"region republished within " + std::to_string(arrived - posted) + " ms, clicks " + r["click"] + ", host presses " + std::to_string(HostCount(WM_LBUTTONDOWN)));
 }
 
+static void DriveNavigation()
+{
+	std::string tag = gComposition ? "navigation (composition): " : "navigation (default): ";
+	{
+		std::lock_guard<std::mutex> guard(gLock);
+		Check(!gNavigations.empty() && gNavigations.front() == L"https://photino.check/main.html" && gRefusedNavigations.empty(),
+			tag + "the page's own first navigation asked about and allowed");
+	}
+	SendToPage("nav-away");
+	std::wstring stayed = WaitFor(L"nav-stayed:");
+	Check(stayed == L"nav-stayed:https://photino.check/main.html;kept" && Refused(L"https://elsewhere.check/away.html")
+		&& Refused(L"https://elsewhere.check/link.html"),
+		tag + "location.href and a link to another origin: cancelled, the page stays with its state", Narrow(stayed));
+	SendToPage("frame-away");
+	std::wstring frame = WaitFor(L"frame-stayed:");
+	Check(frame == L"frame-stayed:about:blank" && Refused(L"https://elsewhere.check/frame.html"),
+		tag + "a frame sent to another origin: cancelled", Narrow(frame));
+}
+
 static void DrivePopups()
 {
 	const wchar_t* mode = gComposition ? L"composition" : L"default";
@@ -652,6 +716,11 @@ static void DrivePopups()
 		std::lock_guard<std::mutex> guard(gLock);
 		Check(!gPopupMessages.empty(), tag + "the popup's own messages reach its own callback");
 	}
+
+	SendToPage("popup-away:p1");
+	std::wstring stayed = WaitFor(L"popup-stayed:p1");
+	Check(stayed == L"popup-stayed:p1:https://photino.check/popup.html;kept" && Refused(L"https://elsewhere.check/popup-away.html"),
+		tag + "the opener sending its popup to another origin: cancelled, the popup's page stays", Narrow(stayed));
 
 	SendToPage("close-popup:p1");
 	std::wstring closed = WaitFor(L"popup-closed:p1");
@@ -714,6 +783,56 @@ static void DrivePopups()
 	long long took = (long long)(GetTickCount64() - asked);
 	Check(timedOut == L"popup-null:p5" && took >= 1400 && took < 4000, tag + "an accepted request never fulfilled is refused after the timeout (1.5 s here)",
 		std::to_string(took) + " ms");
+
+	// Every request's deferral completed exactly once: accepted, refused now, refused later, made late, timed out.
+	int taken = -1, completed = -1, failed = -1;
+	size_t requests = 0;
+	OnUi(gMain, [&] { Photino_GetPopupDeferralCounts_win32(gMain, &taken, &completed, &failed); });
+	{
+		std::lock_guard<std::mutex> guard(gLock);
+		requests = gPopupRequests.size();
+	}
+	Check(taken == (int)requests && completed == taken && failed == 0, tag + "each request's deferral completed exactly once",
+		std::to_string(requests) + " requests, " + std::to_string(taken) + " taken, " + std::to_string(completed) + " completed, "
+		+ std::to_string(failed) + " failed");
+
+	// An opener destroyed with a request pending completes it as it goes.
+	OnUi(gMain, [&] {
+		PhotinoInitParams params = BaseParams("second opener");
+		params.StartUrl = Utf8("https://photino.check/main.html");
+		params.WebMessageReceivedHandler = (WebMessageReceivedCallback*)OnOpener2Message;
+		params.ClosingHandler = (ClosingCallback*)OnMainClosing;
+		PhotinoWindowsOptions options = {};
+		options.Size = sizeof(PhotinoWindowsOptions);
+		options.StartHidden = true;
+		options.CompositionHosting = gComposition;
+		options.PopupRequestedHandler = OnPopupRequested;
+		options.PopupRequestTimeoutMilliseconds = -1;
+		options.DestroyedHandler = OnOpener2Destroyed;
+		gOpener2 = Photino_ctorWithOptions_win32(&params, &options);
+	});
+	bool ready = false;
+	{
+		std::unique_lock<std::mutex> guard(gLock);
+		ready = gChanged.wait_for(guard, std::chrono::seconds(10), [] { return gOpener2Ready; });
+	}
+	OnUi(gMain, [&] { Photino_SendWebMessage(gOpener2, Utf8("open-popup:q1")); });
+	bool requested = false;
+	{
+		std::unique_lock<std::mutex> guard(gLock);
+		requested = gChanged.wait_for(guard, std::chrono::seconds(10), [&] { return gPopupRequests.size() > requests; });
+	}
+	Settle();
+	OnUi(gMain, [&] { Photino_Close(gOpener2); });
+	bool destroyed = false;
+	{
+		std::unique_lock<std::mutex> guard(gLock);
+		destroyed = gChanged.wait_for(guard, std::chrono::seconds(10), [] { return gOpener2Counts[0] >= 0; });
+	}
+	Check(ready && requested && destroyed && gOpener2Counts[0] == 1 && gOpener2Counts[1] == 1 && gOpener2Counts[2] == 0,
+		tag + "an opener destroyed with a request pending completes its deferral once",
+		std::to_string(gOpener2Counts[0]) + " taken, " + std::to_string(gOpener2Counts[1]) + " completed, "
+		+ std::to_string(gOpener2Counts[2]) + " failed");
 	(void)mode;
 }
 
@@ -798,6 +917,8 @@ int wmain(int argc, wchar_t** argv)
 	options.HostInputHandler = OnHostInput;
 	options.PopupRequestedHandler = OnPopupRequested;
 	options.PopupRequestTimeoutMilliseconds = 1500;
+	options.NavigationStartingHandler = OnNavigationStarting;
+	options.BrowserAcceleratorKeysDisabled = true;
 	gMain = gLegacy ? Photino_ctor(&params) : Photino_ctorWithOptions_win32(&params, &options);
 	gMainHwnd = Photino_getHwnd_win32(gMain);
 
@@ -808,7 +929,10 @@ int wmain(int argc, wchar_t** argv)
 		else
 			DriveDefault();
 		if (!gNoHold && !gLegacy)
+		{
+			DriveNavigation();
 			DrivePopups();
+		}
 		printf("mode took %lld ms\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
 		OnUi(gMain, [] { Photino_Close(gMain); });
 	});

@@ -70,6 +70,13 @@ extern "C"
 		opener->RefusePopupRequest(requestId);
 	}
 
+	// On the window's thread: how many popup deferrals the window took (one per window.open request it was asked),
+	// completed, and completed with a failure. A check reads them to see each completed exactly once.
+	EXPORTED void Photino_GetPopupDeferralCounts_win32(Photino* instance, int* taken, int* completed, int* failed)
+	{
+		instance->GetPopupDeferralCounts(taken, completed, failed);
+	}
+
 	// The layout of the Windows option structs as this build sees it, so a binding can check its own against it:
 	// writes the struct's size, then each field's offset in declaration order, and returns how many values that is
 	// (or -1 for an unknown name, or when capacity is too small).
@@ -96,6 +103,8 @@ extern "C"
 			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupOpener),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, PopupRequestId),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, DestroyedHandler),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, NavigationStartingHandler),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, BrowserAcceleratorKeysDisabled),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, Size))
 		PHOTINO_LAYOUT(PhotinoHostInput,
 			PHOTINO_OFFSET(PhotinoHostInput, Message),

@@ -114,6 +114,8 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 		_hostInputCallback = options->HostInputHandler;
 		_popupRequestedCallback = options->PopupRequestedHandler;
 		_destroyedCallback = options->DestroyedHandler;
+		_navigationStartingCallback = options->NavigationStartingHandler;
+		_browserAcceleratorKeysDisabled = options->BrowserAcceleratorKeysDisabled;
 		if (options->PopupOpener != nullptr)
 		{
 			_popupOpenerHwnd = options->PopupOpener->getHwnd();
@@ -1205,6 +1207,30 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 	Settings->put_IsScriptEnabled(TRUE);
 	Settings->put_AreDefaultScriptDialogsEnabled(TRUE);
 	Settings->put_IsWebMessageEnabled(TRUE);
+	if (_browserAcceleratorKeysDisabled)
+	{
+		wil::com_ptr<ICoreWebView2Settings3> settings3;
+		if (SUCCEEDED(Settings->QueryInterface(IID_PPV_ARGS(&settings3))))
+			settings3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+	}
+
+	if (_navigationStartingCallback != nullptr)
+	{
+		// The page's own navigations and its frames' both: a refused one is cancelled and the page stays as it is.
+		auto navigationStarting = [this](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+			wil::unique_cotaskmem_string uri;
+			args->get_Uri(&uri);
+			if (!_navigationStartingCallback(uri.get()))
+				args->put_Cancel(TRUE);
+			return S_OK;
+		};
+		EventRegistrationToken navigationStartingToken;
+		_webviewWindow->add_NavigationStarting(
+			Callback<ICoreWebView2NavigationStartingEventHandler>(navigationStarting).Get(), &navigationStartingToken);
+		EventRegistrationToken frameNavigationStartingToken;
+		_webviewWindow->add_FrameNavigationStarting(
+			Callback<ICoreWebView2NavigationStartingEventHandler>(navigationStarting).Get(), &frameNavigationStartingToken);
+	}
 
 	EventRegistrationToken webMessageToken;
 	_webviewWindow->AddScriptToExecuteOnDocumentCreated(L"window.external = { sendMessage: function(message) { window.chrome.webview.postMessage(message); }, receiveMessage: function(callback) { window.chrome.webview.addEventListener(\'message\', function(e) { callback(e.data); }); } };", nullptr);
@@ -1278,7 +1304,8 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 				int requestId = ++_nextPopupRequestId;
 				PendingPopup& pending = _pendingPopups[requestId];
 				pending.args = args;
-				args->GetDeferral(&pending.deferral);
+				if (SUCCEEDED(args->GetDeferral(&pending.deferral)) && pending.deferral)
+					++_popupDeferralsTaken;
 				wil::unique_cotaskmem_string uri;
 				args->get_Uri(&uri);
 				PhotinoPopupFeatures features = {};

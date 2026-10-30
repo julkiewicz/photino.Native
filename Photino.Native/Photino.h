@@ -169,6 +169,9 @@ typedef bool (*HostInputCallback)(const PhotinoHostInput *input);
 typedef bool (*PopupRequestedCallback)(int requestId, AutoString uri, const PhotinoPopupFeatures *features);
 // The window was destroyed (WM_DESTROY): no callback is made for this window after this one.
 typedef void (*DestroyedCallback)();
+// Called before the page, or a frame in it, navigates to uri (a link, a script setting location, a reload, a dropped
+// file or link). Return false to cancel the navigation: the page stays as it is.
+typedef bool (*NavigationStartingCallback)(AutoString uri);
 
 struct PhotinoWindowsOptions
 {
@@ -200,6 +203,12 @@ struct PhotinoWindowsOptions
 	int PopupRequestId;
 	// Called once when the window is destroyed, after its surface handles are closed. May be null.
 	DestroyedCallback DestroyedHandler;
+	// Called before every navigation of the page and of its frames, the first one included. Null keeps WebView2's
+	// own behavior.
+	NavigationStartingCallback NavigationStartingHandler;
+	// Turn off the browser's own keys (reload, find, print, history, zoom and the like); the page still gets every
+	// key. DevTools' keys follow the DevTools setting.
+	bool BrowserAcceleratorKeysDisabled;
 
 	int Size;
 };
@@ -279,6 +288,13 @@ private:
 	HostInputCallback _hostInputCallback = nullptr;
 	PopupRequestedCallback _popupRequestedCallback = nullptr;
 	DestroyedCallback _destroyedCallback = nullptr;
+	NavigationStartingCallback _navigationStartingCallback = nullptr;
+	bool _browserAcceleratorKeysDisabled = false;
+	// Popup deferrals taken (one per window.open request), completed, and completions WebView2 refused: a check of
+	// their counts (Photino_GetPopupDeferralCounts_win32) sees each completed exactly once.
+	int _popupDeferralsTaken = 0;
+	int _popupDeferralsCompleted = 0;
+	int _popupDeferralsFailed = 0;
 	HWND _popupOpenerHwnd = nullptr;
 	int _popupRequestId = 0;
 	int _nextPopupRequestId = 0;
@@ -368,6 +384,7 @@ public:
 	bool HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT *result);
 	void ShowHidden();
 	void RefusePopupRequest(int requestId);
+	void GetPopupDeferralCounts(int *taken, int *completed, int *failed);
 	void OnWindowDestroyed();
 	void GetCompositionHostingEnabled(bool *enabled);
 	HANDLE AddCompositionSurface(int x, int y, int width, int height);
