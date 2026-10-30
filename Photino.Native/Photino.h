@@ -199,7 +199,9 @@ struct PhotinoHostDrop
 // it leaves the host's area, and the host gets no over, leave or drop for it meanwhile.
 #define PHOTINO_HOST_DROP_TO_PAGE 0xFFFFFFFFu
 // Return the DROPEFFECT_* the host takes (DROPEFFECT_NONE refuses it there), masked by AllowedEffects; for an enter,
-// PHOTINO_HOST_DROP_TO_PAGE passes the drag to the page instead. The return of a leave is ignored.
+// PHOTINO_HOST_DROP_TO_PAGE passes the drag to the page instead (for any other kind it is only masked). The return of a
+// leave is ignored. It is called inside OLE's call to the window: to close the window from it, post the close (closing
+// it in the call ends the drag, which the host then hears as a leave).
 typedef unsigned int (*HostDropCallback)(const PhotinoHostDrop *drop);
 
 struct PhotinoWindowsOptions
@@ -361,12 +363,15 @@ private:
 	std::wstring _dragFormats;
 	InputTarget _dragSide = InputTarget::None;	// the side the drag is with now
 	bool _dragOverHostArea = false;	// over the host's area (the host asked once per stay)
+	bool _dragStaleTimerArmed = false;
 	void RegisterDropTarget();
 	HRESULT OnDragEnter(IDataObject *data, DWORD keyState, POINTL screen, DWORD *effect);
 	HRESULT OnDragOver(DWORD keyState, POINTL screen, DWORD *effect);
 	HRESULT OnDragLeave();
 	HRESULT OnDrop(IDataObject *data, DWORD keyState, POINTL screen, DWORD *effect);
-	void RouteDrag(DWORD keyState, POINT point, DWORD *effect, bool dropping);
+	bool RouteDrag(DWORD keyState, POINT point, DWORD *effect, bool dropping);
+	void NoteMouseDuringDrag(WPARAM wParam);
+	void EndStaleDrag();
 	DWORD SendHostDrop(int kind, POINT point, DWORD keyState, DWORD allowed, IDataObject *data);
 	void EndDrag();
 	bool CaptureTakenByPage(HWND window);

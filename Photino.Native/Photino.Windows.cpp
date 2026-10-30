@@ -1204,6 +1204,19 @@ HRESULT Photino::OnWebViewControllerCreated(HRESULT result, ICoreWebView2Control
 				}
 				return S_OK;
 			}).Get(), &cursorChangedToken);
+
+		// The window becomes the page's drop target. A browser process that fails mid-drag never sends the drop or
+		// leave it owes, so the drag ends here then.
+		RegisterDropTarget();
+		if (_dropTarget)
+		{
+			EventRegistrationToken processFailedToken;
+			_webviewWindow->add_ProcessFailed(Callback<ICoreWebView2ProcessFailedEventHandler>(
+				[this](ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) -> HRESULT {
+					EndDrag();
+					return S_OK;
+				}).Get(), &processFailedToken);
+		}
 	}
 
 	ICoreWebView2Settings* Settings;

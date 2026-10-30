@@ -79,6 +79,7 @@ static int gFailures = 0;
 struct HostDropEvent { int kind; std::wstring formats, files, text; bool hasFiles, hasText; };
 static std::vector<HostDropEvent> gHostDrops;
 static unsigned int gHostDropAnswer = PHOTINO_HOST_DROP_TO_PAGE;	// the host's answer to an enter
+static bool gOverAnswersToPage = false;	// the host answers an over with PHOTINO_HOST_DROP_TO_PAGE (only masked)
 
 static void Check(bool ok, const std::string& name, const std::string& detail = "")
 {
@@ -282,6 +283,8 @@ static unsigned int OnHostDrop(const PhotinoHostDrop* drop)
 		drop->Text ? drop->Text : L"", drop->Files != nullptr, drop->Text != nullptr });
 	if (drop->Kind == PHOTINO_HOST_DROP_ENTER)
 		return gHostDropAnswer;
+	if (drop->Kind == PHOTINO_HOST_DROP_OVER && gOverAnswersToPage)
+		return PHOTINO_HOST_DROP_TO_PAGE;
 	return gHostDropAnswer == PHOTINO_HOST_DROP_TO_PAGE ? DROPEFFECT_NONE : gHostDropAnswer;
 }
 
@@ -898,25 +901,69 @@ static void DriveDragDrop()
 	Check(HostDropCount(PHOTINO_HOST_DROP_ENTER) == 2 && HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 2 && Int(r, "dragenter") >= 1 && Int(r, "dragleave") >= 1,
 		"drag and drop: crossing from the host's area to the page and back: leave and enter on each side", DragCounts(r));
 
-	// A drag the page starts from a press it holds: the drag carries the press, so the page is no longer its owner; while
-	// the drag is over the window no mouse message is routed (OLE's loop has the mouse).
+	// A drag the page starts from a press it holds (as in Microsoft's composition sample): the window keeps capture and
+	// the page keeps every mouse message, the button-up included, while the drag is over the window.
 	ResetDrag(PHOTINO_HOST_DROP_TO_PAGE);
 	Post(WM_LBUTTONDOWN, lx, ly, MK_LBUTTON);
 	Settle(150);
 	DragCall(DragEnterCall, text.get(), lx, ly);
 	Post(WM_MOUSEMOVE, sx, sy, MK_LBUTTON);
-	Post(WM_MOUSEMOVE, lx, ly, MK_LBUTTON);
+	Post(WM_MOUSEMOVE, sx + 5, sy, MK_LBUTTON);
+	Post(WM_LBUTTONUP, sx + 5, sy, 0);
 	Settle();
-	r = Report();
-	int movesDuringDrag = HostCount(WM_MOUSEMOVE) + Int(r, "pointermove");
 	DragCall(DragLeaveCall, nullptr, 0, 0);
+	r = Report();
+	int hostDuringDrag = HostCount(WM_MOUSEMOVE) + HostCount(WM_LBUTTONUP);
 	Post(WM_MOUSEMOVE, sx, sy, 0);
 	Settle();
-	Check(movesDuringDrag == 0 && HostCount(WM_MOUSEMOVE) >= 1,
-		"drag and drop: a drag entering while the page holds a press frees the press; no mouse routed during the drag",
-		"moves routed during the drag " + std::to_string(movesDuringDrag) + ", host moves after " + std::to_string(HostCount(WM_MOUSEMOVE)));
-	Post(WM_LBUTTONUP, lx, ly, 0);
+	Check(hostDuringDrag == 0 && Int(r, "pointerdown") == 1 && Int(r, "pointerup") == 1 && HostCount(WM_MOUSEMOVE) >= 1,
+		"drag and drop: a drag started from a page press: the page keeps its moves and its button-up, then the press ends",
+		"host messages during the drag " + std::to_string(hostDuringDrag) + ", page down " + r["pointerdown"] + " moves " + r["pointermove"]
+		+ " up " + r["pointerup"] + ", host moves after " + std::to_string(HostCount(WM_MOUSEMOVE)));
+
+	// A host refusing on enter keeps the drag (none), is asked on each over, and hears the leave; the page nothing.
+	ResetDrag(DROPEFFECT_NONE);
+	DWORD refusedEnter = DragCall(DragEnterCall, text.get(), sx, sy);
+	DWORD refusedOver = DragCall(DragOverCall, nullptr, sx + 5, sy);
+	DragCall(DragLeaveCall, nullptr, 0, 0);
 	Settle();
+	r = Report();
+	Check(refusedEnter == DROPEFFECT_NONE && refusedOver == DROPEFFECT_NONE && HostDropCount(PHOTINO_HOST_DROP_OVER) == 1
+		&& HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 1 && Int(r, "dragenter") == 0,
+		"drag and drop: a host refusing on enter keeps the drag (effect none), asked on over, hears its leave; the page nothing",
+		"effects " + std::to_string(refusedEnter) + "/" + std::to_string(refusedOver) + "; " + DragCounts(r));
+
+	// PHOTINO_HOST_DROP_TO_PAGE answered to an over is no pass: it is masked into the allowed effects.
+	ResetDrag(DROPEFFECT_COPY);
+	gOverAnswersToPage = true;
+	DragCall(DragEnterCall, text.get(), sx, sy);
+	DWORD maskedOver = DragCall(DragOverCall, nullptr, sx + 5, sy);
+	DragCall(DragLeaveCall, nullptr, 0, 0);
+	gOverAnswersToPage = false;
+	Settle();
+	r = Report();
+	Check(maskedOver == (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) && Int(r, "dragenter") == 0 && HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 1,
+		"drag and drop: PHOTINO_HOST_DROP_TO_PAGE returned for an over is masked into the allowed effects, not a pass",
+		"effect " + std::to_string(maskedOver) + "; " + DragCounts(r));
+
+	// A drag whose source died (no drop, no leave): a mouse message with no button down while it is here ends it a
+	// little later, both sides hearing their leave, and that message and the next are routed as usual.
+	ResetDrag(DROPEFFECT_COPY);
+	DragCall(DragEnterCall, text.get(), sx, sy);
+	Post(WM_MOUSEMOVE, sx + 5, sy, 0);
+	Settle(900);
+	int hostLeaves = HostDropCount(PHOTINO_HOST_DROP_LEAVE), hostMoves = HostCount(WM_MOUSEMOVE);
+	DragCall(DragEnterCall, text.get(), lx, ly);
+	Settle(150);
+	Post(WM_MOUSEMOVE, lx + 5, ly, 0);
+	Settle(900);
+	r = Report();
+	DWORD afterStale = DragCall(DragOverCall, nullptr, lx + 6, ly);
+	DragCall(DragLeaveCall, nullptr, 0, 0);
+	Check(hostLeaves == 1 && hostMoves == 1 && Int(r, "dragleave") >= 1 && Int(r, "pointermove") >= 1 && afterStale == DROPEFFECT_NONE,
+		"drag and drop: a drag left without its drop or leave ends on a buttonless mouse message, both sides told, the message routed",
+		"host leaves " + std::to_string(hostLeaves) + ", host moves " + std::to_string(hostMoves) + "; page leaves " + r["dragleave"]
+		+ " moves " + r["pointermove"] + "; an over after it " + std::to_string(afterStale));
 
 	// Capture taken by WebView2's own browser process (its drag loop, a dropdown) during a page press: no release is
 	// sent to the page, and the press is freed.
@@ -948,6 +995,31 @@ static void DriveDragDrop()
 		"page ups " + std::to_string(upsAfterCapture) + ", host moves after " + std::to_string(HostCount(WM_MOUSEMOVE)));
 	Post(WM_LBUTTONUP, lx, ly, 0);
 	Settle();
+}
+
+// The last case: the window destroyed with a drag over its host's area (it closes the window).
+static void DriveDragOnClose()
+{
+	if (!gDropTarget)
+	{
+		OnUi(gMain, [] { Photino_Close(gMain); });
+		return;
+	}
+	ResetDrag(DROPEFFECT_COPY);
+	gDropTarget->AddRef();	// held as a drag's source would hold it past the window
+	IDropTarget* kept = gDropTarget;
+	auto text = MakeData(L"closing", L"");
+	DragCall(DragEnterCall, text.get(), 200, 400);
+	OnUi(gMain, [] { Photino_Close(gMain); });
+	for (int i = 0; i < 100 && IsWindow(gMainHwnd); ++i)
+		Settle(50);	// the close is posted
+	DWORD late = DROPEFFECT_COPY;
+	POINTL point = { 0, 0 };
+	HRESULT lateResult = kept->DragOver(MK_LBUTTON, point, &late);	// detached: answers without the window
+	kept->Release();
+	Check(HostDropCount(PHOTINO_HOST_DROP_ENTER) == 1 && HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 1 && lateResult == S_OK && late == DROPEFFECT_NONE,
+		"drag and drop: the window destroyed with a drag over it: the host gets its leave, the drop target then answers none",
+		"host enter " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_ENTER)) + " leave " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_LEAVE)) + ", late effect " + std::to_string(late));
 }
 
 static void DrivePopups()
@@ -1201,7 +1273,10 @@ int wmain(int argc, wchar_t** argv)
 			DrivePopups();
 		}
 		printf("mode took %lld ms\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
-		OnUi(gMain, [] { Photino_Close(gMain); });
+		if (gComposition && !gNoHold)
+			DriveDragOnClose();
+		else
+			OnUi(gMain, [] { Photino_Close(gMain); });
 	});
 	Photino_WaitForExit(gMain);
 	driver.join();

@@ -11,6 +11,8 @@
 #pragma comment(lib, "dcomp.lib")
 
 #define HIT_REGION_HOLD_TIMER_ID 0x50484F4C
+#define DRAG_STALE_TIMER_ID 0x50445247
+#define DRAG_STALE_MILLISECONDS 500
 
 static bool IsMousePress(UINT message)
 {
@@ -66,8 +68,6 @@ HRESULT Photino::AttachCompositionController()
 	HRESULT hr = _compositionController->put_RootVisualTarget(_dcompWebVisual.get());
 	if (SUCCEEDED(hr)) hr = _dcompDevice->Commit();
 	MarkHitRegionsStale();	// until the page publishes its first regions
-	if (SUCCEEDED(hr))
-		RegisterDropTarget();
 	return hr;
 }
 
@@ -128,14 +128,26 @@ private:
 void Photino::RegisterDropTarget()
 {
 	// WebView2's composition controller takes drags only from its host: the window must be the drop target.
-	if (!_oleInitialized || _dropTarget || !_compositionController)
+	if (_dropTarget || !_compositionController)
 		return;
+	if (!_oleInitialized)
+	{
+		OutputDebugStringW(L"Photino: OLE could not be initialized on the window's thread (a multithreaded apartment?): no drag and drop in composition mode\n");
+		return;
+	}
 	if (FAILED(_compositionController->QueryInterface(IID_PPV_ARGS(&_dragController))))
+	{
+		OutputDebugStringW(L"Photino: the WebView2 runtime has no ICoreWebView2CompositionController3: no drag and drop in composition mode\n");
 		return;
+	}
 	wil::com_ptr<IDropTarget> target;
 	target.attach(new PhotinoDropTarget(this));
-	if (FAILED(RegisterDragDrop(_hWnd, target.get())))
+	HRESULT registered = RegisterDragDrop(_hWnd, target.get());
+	if (FAILED(registered))
 	{
+		wchar_t line[160];
+		swprintf(line, _countof(line), L"Photino: RegisterDragDrop failed (0x%08lX): no drag and drop in composition mode\n", (unsigned long)registered);
+		OutputDebugStringW(line);
 		static_cast<PhotinoDropTarget*>(target.get())->Detach();
 		_dragController.reset();
 		return;
@@ -187,6 +199,11 @@ static bool FilesOf(IDataObject* data, std::wstring* files)
 	STGMEDIUM medium = {};
 	if (FAILED(data->GetData(&format, &medium)))
 		return false;
+	if (medium.tymed != TYMED_HGLOBAL)
+	{
+		ReleaseStgMedium(&medium);	// a source answering with another medium than asked for
+		return false;
+	}
 	HDROP drop = (HDROP)GlobalLock(medium.hGlobal);
 	if (drop != nullptr)
 	{
@@ -212,6 +229,11 @@ static bool TextOf(IDataObject* data, std::wstring* text)
 	STGMEDIUM medium = {};
 	if (FAILED(data->GetData(&format, &medium)))
 		return false;
+	if (medium.tymed != TYMED_HGLOBAL)
+	{
+		ReleaseStgMedium(&medium);	// a source answering with another medium than asked for
+		return false;
+	}
 	const wchar_t* chars = (const wchar_t*)GlobalLock(medium.hGlobal);
 	if (chars != nullptr)
 	{
@@ -238,10 +260,11 @@ DWORD Photino::SendHostDrop(int kind, POINT point, DWORD keyState, DWORD allowed
 	return _hostDropCallback(&drop);
 }
 
-void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool dropping)
+bool Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool dropping)
 {
 	// By the hit regions, as the mouse: over the host's area the host is asked first (once per stay there) and may pass
-	// the drag to the page. Without a host drop handler the page has the whole window.
+	// the drag to the page. Without a host drop handler the page has the whole window. Returns false when the window
+	// was destroyed meanwhile (a host handler closing it), the drag then over.
 	DWORD allowed = *effect;
 	bool overHostArea = _hostDropCallback != nullptr && TargetAt(point) == InputTarget::Host;
 	InputTarget side = _dragSide;
@@ -249,13 +272,18 @@ void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool droppin
 	{
 		_dragOverHostArea = true;
 		DWORD answer = SendHostDrop(PHOTINO_HOST_DROP_ENTER, point, keyState, allowed, _dragData.get());
+		if (!_dropTarget)
+		{
+			*effect = DROPEFFECT_NONE;
+			return false;
+		}
 		if (answer != PHOTINO_HOST_DROP_TO_PAGE)
 		{
 			if (side == InputTarget::Page)
 				_dragController->DragLeave();
 			_dragSide = InputTarget::Host;
 			*effect = answer & allowed;
-			return;
+			return true;
 		}
 		side = InputTarget::Page;	// passed to the page (it may have it already)
 	}
@@ -263,7 +291,15 @@ void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool droppin
 	{
 		_dragOverHostArea = false;
 		if (side == InputTarget::Host)
+		{
+			_dragSide = InputTarget::None;
 			SendHostDrop(PHOTINO_HOST_DROP_LEAVE, point, keyState, allowed, nullptr);
+			if (!_dropTarget)
+			{
+				*effect = DROPEFFECT_NONE;
+				return false;
+			}
+		}
 		side = InputTarget::Page;
 	}
 	else if (side == InputTarget::None)
@@ -273,8 +309,13 @@ void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool droppin
 
 	if (side == InputTarget::Host)
 	{
-		*effect = dropping ? allowed : SendHostDrop(PHOTINO_HOST_DROP_OVER, point, keyState, allowed, nullptr) & allowed;
-		return;
+		if (dropping)
+		{
+			*effect = allowed;
+			return true;
+		}
+		*effect = SendHostDrop(PHOTINO_HOST_DROP_OVER, point, keyState, allowed, nullptr) & allowed;
+		return _dropTarget != nullptr;
 	}
 	if (_dragSide != InputTarget::Page)
 	{
@@ -285,42 +326,37 @@ void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool droppin
 	{
 		_dragController->DragOver(keyState, point, effect);
 	}
+	return true;
 }
 
 HRESULT Photino::OnDragEnter(IDataObject* data, DWORD keyState, POINTL screen, DWORD* effect)
 {
-	// A press the page still holds started this drag (WebView2 runs the page's drags itself): the drag carries the
-	// button now, and its end reaches the page through the drop, so no release is owed to the page.
-	if (_inputOwner == InputTarget::Page)
-	{
-		_inputOwner = InputTarget::None;
-		_ownerMouseKeys = 0;
-		if (GetCapture() == _hWnd)
-			ReleaseCapture();
-	}
+	// A drag the page starts from a press keeps that press as it is: the window keeps capture and the page keeps every
+	// mouse message, the button-up included, as in Microsoft's composition sample (WebView2 runs the page's drags
+	// itself).
 	EndDrag();
 	_dragData = data;
-	_dragFormats = FormatsOf(data);
-	POINT point = { screen.x, screen.y };
-	if (_dropHelper)
-		_dropHelper->DragEnter(_hWnd, data, &point, *effect);
+	if (_hostDropCallback != nullptr)
+		_dragFormats = FormatsOf(data);	// for the host only
+	POINT screenPoint = { screen.x, screen.y }, point = screenPoint;
 	ScreenToClient(_hWnd, &point);
-	RouteDrag(keyState, point, effect, false);
+	if (!RouteDrag(keyState, point, effect, false))
+		return S_OK;
+	if (_dropHelper)
+		_dropHelper->DragEnter(_hWnd, data, &screenPoint, *effect);
 	return S_OK;
 }
 
 HRESULT Photino::OnDragOver(DWORD keyState, POINTL screen, DWORD* effect)
 {
-	POINT point = { screen.x, screen.y };
-	if (_dropHelper)
-		_dropHelper->DragOver(&point, *effect);
+	POINT screenPoint = { screen.x, screen.y }, point = screenPoint;
 	ScreenToClient(_hWnd, &point);
 	if (!_dragData)
-	{
-		*effect = DROPEFFECT_NONE;
+		*effect = DROPEFFECT_NONE;	// the drag was ended here (a stale drag, a failed browser process)
+	else if (!RouteDrag(keyState, point, effect, false))
 		return S_OK;
-	}
-	RouteDrag(keyState, point, effect, false);
+	if (_dropHelper)
+		_dropHelper->DragOver(&screenPoint, *effect);
 	return S_OK;
 }
 
@@ -334,21 +370,30 @@ HRESULT Photino::OnDragLeave()
 
 HRESULT Photino::OnDrop(IDataObject* data, DWORD keyState, POINTL screen, DWORD* effect)
 {
-	POINT point = { screen.x, screen.y };
-	if (_dropHelper)
-		_dropHelper->Drop(data, &point, *effect);
+	POINT screenPoint = { screen.x, screen.y }, point = screenPoint;
 	ScreenToClient(_hWnd, &point);
 	if (!_dragData)
-		_dragData = data;
+	{
+		_dragData = data;	// the drag was ended here before its drop arrived: deliver it anyway
+		if (_hostDropCallback != nullptr)
+			_dragFormats = FormatsOf(data);
+	}
 	DWORD allowed = *effect;
-	RouteDrag(keyState, point, effect, true);
+	if (!RouteDrag(keyState, point, effect, true))
+		return S_OK;
 	if (_dragSide == InputTarget::Host)
+	{
 		*effect = SendHostDrop(PHOTINO_HOST_DROP_DROP, point, keyState, allowed, data) & allowed;
+		if (!_dropTarget)
+			return S_OK;	// destroyed by the host's handler: the drag was ended there
+	}
 	else
 	{
 		*effect = allowed;
 		_dragController->Drop(data, keyState, point, effect);
 	}
+	if (_dropHelper)
+		_dropHelper->Drop(data, &screenPoint, *effect);
 	_dragSide = InputTarget::None;	// dropped: no leave follows
 	EndDrag();
 	return S_OK;
@@ -356,15 +401,41 @@ HRESULT Photino::OnDrop(IDataObject* data, DWORD keyState, POINTL screen, DWORD*
 
 void Photino::EndDrag()
 {
-	// The drag left the window (or a new one starts): the side that has it gets its leave.
-	if (_dragSide == InputTarget::Page && _dragController)
-		_dragController->DragLeave();
-	else if (_dragSide == InputTarget::Host)
-		SendHostDrop(PHOTINO_HOST_DROP_LEAVE, { 0, 0 }, 0, 0, nullptr);
+	// The drag left the window (or a new one starts, or it went stale): the side that has it gets its leave.
+	KillTimer(_hWnd, DRAG_STALE_TIMER_ID);
+	_dragStaleTimerArmed = false;
+	InputTarget side = _dragSide;
 	_dragSide = InputTarget::None;
 	_dragOverHostArea = false;
 	_dragData.reset();
 	_dragFormats.clear();
+	if (side == InputTarget::Page && _dragController)
+		_dragController->DragLeave();
+	else if (side == InputTarget::Host)
+		SendHostDrop(PHOTINO_HOST_DROP_LEAVE, { 0, 0 }, 0, 0, nullptr);
+}
+
+void Photino::NoteMouseDuringDrag(WPARAM wParam)
+{
+	// OLE owes a drag over the window its drop or leave only while the drag's source lives: a mouse message with no
+	// button down while a drag is still here suggests the source is gone. The drag ends if it is still here a little
+	// later with no button physically down (the grace lets the drop that follows a real button-up arrive first).
+	const WPARAM buttons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
+	if (_dragSide == InputTarget::None || (GET_KEYSTATE_WPARAM(wParam) & buttons) != 0 || _dragStaleTimerArmed)
+		return;
+	_dragStaleTimerArmed = SetTimer(_hWnd, DRAG_STALE_TIMER_ID, DRAG_STALE_MILLISECONDS, nullptr) != 0;
+}
+
+void Photino::EndStaleDrag()
+{
+	KillTimer(_hWnd, DRAG_STALE_TIMER_ID);
+	_dragStaleTimerArmed = false;
+	if (_dragSide == InputTarget::None)
+		return;
+	for (int button : { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 })
+		if (GetAsyncKeyState(button) & 0x8000)
+			return;	// a button is down after all: the next buttonless message looks again
+	EndDrag();
 }
 
 bool Photino::CaptureTakenByPage(HWND window)
@@ -768,13 +839,7 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 
 	if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST)
 	{
-		if (_dragSide != InputTarget::None)
-		{
-			// A drag is over the window: OLE's drag loop has the mouse and the drag's side gets it as drag events, as
-			// with the usual hosting, where the page's window gets no mouse messages meanwhile.
-			*result = 0;
-			return true;
-		}
+		NoteMouseDuringDrag(wParam);	// routed as usual; a buttonless one may show a drag gone stale
 		if (_hitRegionsStale && _inputOwner == InputTarget::None && (IsMousePress(message) || !_heldInput.empty()))
 		{
 			ULONGLONG waited = GetTickCount64() - _hitRegionsStaleSince;
@@ -860,6 +925,12 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 	}
 	case WM_TIMER:
 	{
+		if (wParam == DRAG_STALE_TIMER_ID)
+		{
+			EndStaleDrag();
+			*result = 0;
+			return true;
+		}
 		if (wParam != HIT_REGION_HOLD_TIMER_ID)
 			return false;
 		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
@@ -980,11 +1051,6 @@ void Photino::OnWindowDestroyed()
 		_dropHelper.reset();
 		_dragController.reset();
 	}
-	if (_oleInitialized)
-	{
-		_oleInitialized = false;
-		OleUninitialize();
-	}
 	if (_hasWindowsOptions || _compositionController || _popupOpenerHwnd != nullptr)
 	{
 		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
@@ -1000,6 +1066,12 @@ void Photino::OnWindowDestroyed()
 		_dcompTarget.reset();
 		_dcompDevice.reset();
 		_compositionController.reset();
+	}
+	if (_oleInitialized)
+	{
+		// Last, once the controller (which uses OLE itself) is closed.
+		_oleInitialized = false;
+		OleUninitialize();
 	}
 
 	if (_destroyedCallback != nullptr)
