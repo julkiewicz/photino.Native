@@ -60,6 +60,14 @@ extern "C"
 		instance->SetHitRegions(rects, count, regionsArePage);
 	}
 
+	// The window's OLE drop target in composition mode (null otherwise, or before the page's controller exists):
+	// borrowed, valid until the window is destroyed. For a host that forwards drags it receives elsewhere, or a check
+	// that drives drag and drop without a mouse.
+	EXPORTED IDropTarget* Photino_GetDropTarget_win32(Photino* instance)
+	{
+		return instance->GetDropTarget();
+	}
+
 	EXPORTED void Photino_Show_win32(Photino* instance)
 	{
 		instance->ShowHidden();
@@ -105,6 +113,7 @@ extern "C"
 			PHOTINO_OFFSET(PhotinoWindowsOptions, DestroyedHandler),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, NavigationStartingHandler),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, BrowserAcceleratorKeysDisabled),
+			PHOTINO_OFFSET(PhotinoWindowsOptions, HostDropHandler),
 			PHOTINO_OFFSET(PhotinoWindowsOptions, Size))
 		PHOTINO_LAYOUT(PhotinoHostInput,
 			PHOTINO_OFFSET(PhotinoHostInput, Message),
@@ -125,6 +134,15 @@ extern "C"
 			PHOTINO_OFFSET(PhotinoPopupFeatures, Top),
 			PHOTINO_OFFSET(PhotinoPopupFeatures, Width),
 			PHOTINO_OFFSET(PhotinoPopupFeatures, Height))
+		PHOTINO_LAYOUT(PhotinoHostDrop,
+			PHOTINO_OFFSET(PhotinoHostDrop, Kind),
+			PHOTINO_OFFSET(PhotinoHostDrop, X),
+			PHOTINO_OFFSET(PhotinoHostDrop, Y),
+			PHOTINO_OFFSET(PhotinoHostDrop, KeyState),
+			PHOTINO_OFFSET(PhotinoHostDrop, AllowedEffects),
+			PHOTINO_OFFSET(PhotinoHostDrop, Formats),
+			PHOTINO_OFFSET(PhotinoHostDrop, Files),
+			PHOTINO_OFFSET(PhotinoHostDrop, Text))
 #undef PHOTINO_OFFSET
 #undef PHOTINO_LAYOUT
 		return -1;

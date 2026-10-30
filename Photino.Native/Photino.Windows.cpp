@@ -116,6 +116,7 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 		_destroyedCallback = options->DestroyedHandler;
 		_navigationStartingCallback = options->NavigationStartingHandler;
 		_browserAcceleratorKeysDisabled = options->BrowserAcceleratorKeysDisabled;
+		_hostDropCallback = options->HostDropHandler;
 		if (options->PopupOpener != nullptr)
 		{
 			_popupOpenerHwnd = options->PopupOpener->getHwnd();
@@ -307,6 +308,10 @@ Photino::Photino(PhotinoInitParams* initParams, const PhotinoWindowsOptions* opt
 	// visual waits for the controller.
 	if (_compositionHosting && !CreateCompositionTree())
 		_compositionHosting = false;
+	// The window becomes its page's drop target once the composition controller exists: OLE on this thread first
+	// (an apartment-threaded thread gets it; a multithreaded one cannot, and then has no drag and drop).
+	if (_compositionHosting)
+		_oleInitialized = SUCCEEDED(OleInitialize(nullptr));
 
 	if (initParams->WindowIconFile != NULL)
 	{

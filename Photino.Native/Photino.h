@@ -5,6 +5,7 @@
 #include <wil/com.h>
 #include <WebView2.h>
 #include <dcomp.h>
+#include <ShlObj.h>
 typedef wchar_t *AutoString;
 class WinToastHandler;
 #else
@@ -173,6 +174,34 @@ typedef void (*DestroyedCallback)();
 // file or link). Return false to cancel the navigation: the page stays as it is.
 typedef bool (*NavigationStartingCallback)(AutoString uri);
 
+// Composition mode: one drag and drop event over the host's area (outside the page's hit regions). Kind is one of
+// PHOTINO_HOST_DROP_*. X and Y are in client pixels; KeyState holds the MK_* flags; AllowedEffects the DROPEFFECT_*
+// flags the drag's source allows. Formats names the data's clipboard formats (standard ones as CF_*, registered ones
+// by name), one per line, on every kind but leave. On a drop, Files holds the dropped files' paths (CF_HDROP) and Text
+// the data's text (CF_UNICODETEXT), one per line, each null when the data has none. The strings live for the call only.
+#define PHOTINO_HOST_DROP_ENTER 0
+#define PHOTINO_HOST_DROP_OVER 1
+#define PHOTINO_HOST_DROP_LEAVE 2
+#define PHOTINO_HOST_DROP_DROP 3
+struct PhotinoHostDrop
+{
+	int Kind;
+	int X;
+	int Y;
+	unsigned int KeyState;
+	unsigned int AllowedEffects;
+	AutoString Formats;
+	AutoString Files;
+	AutoString Text;
+};
+
+// Returned for an enter: the host does not take this drag here; it goes to the page (as over the page's regions) until
+// it leaves the host's area, and the host gets no over, leave or drop for it meanwhile.
+#define PHOTINO_HOST_DROP_TO_PAGE 0xFFFFFFFFu
+// Return the DROPEFFECT_* the host takes (DROPEFFECT_NONE refuses it there), masked by AllowedEffects; for an enter,
+// PHOTINO_HOST_DROP_TO_PAGE passes the drag to the page instead. The return of a leave is ignored.
+typedef unsigned int (*HostDropCallback)(const PhotinoHostDrop *drop);
+
 struct PhotinoWindowsOptions
 {
 	// Create the window without showing it (the page still loads, lays out and runs; it never takes focus).
@@ -209,6 +238,11 @@ struct PhotinoWindowsOptions
 	// Turn off the browser's own keys (reload, find, print, history, zoom and the like); the page still gets every
 	// key. DevTools' keys follow the DevTools setting.
 	bool BrowserAcceleratorKeysDisabled;
+	// Composition mode: drags over the window (OLE drag and drop, from the page itself, another window or another app)
+	// go to the page through the composition controller, as the usual hosting does; the window is their drop target,
+	// with OLE initialized on its thread. With this handler, a drag over the host's area (outside the page's hit
+	// regions) is offered to the host first (see HostDropCallback). Null: every drag goes to the page.
+	HostDropCallback HostDropHandler;
 
 	int Size;
 };
@@ -315,6 +349,27 @@ private:
 	InputTarget _hoverTarget = InputTarget::None;
 	bool _trackingMouseLeave = false;
 	SIZE _lastClientSize = {};
+	// Drag and drop in composition mode: the window's drop target forwards to the composition controller (the page)
+	// or to the host, by the hit regions.
+	friend class PhotinoDropTarget;
+	HostDropCallback _hostDropCallback = nullptr;
+	bool _oleInitialized = false;
+	wil::com_ptr<ICoreWebView2CompositionController3> _dragController;
+	wil::com_ptr<IDropTarget> _dropTarget;
+	wil::com_ptr<IDropTargetHelper> _dropHelper;
+	wil::com_ptr<IDataObject> _dragData;
+	std::wstring _dragFormats;
+	InputTarget _dragSide = InputTarget::None;	// the side the drag is with now
+	bool _dragOverHostArea = false;	// over the host's area (the host asked once per stay)
+	void RegisterDropTarget();
+	HRESULT OnDragEnter(IDataObject *data, DWORD keyState, POINTL screen, DWORD *effect);
+	HRESULT OnDragOver(DWORD keyState, POINTL screen, DWORD *effect);
+	HRESULT OnDragLeave();
+	HRESULT OnDrop(IDataObject *data, DWORD keyState, POINTL screen, DWORD *effect);
+	void RouteDrag(DWORD keyState, POINT point, DWORD *effect, bool dropping);
+	DWORD SendHostDrop(int kind, POINT point, DWORD keyState, DWORD allowed, IDataObject *data);
+	void EndDrag();
+	bool CaptureTakenByPage(HWND window);
 	void CreateWebViewController(ICoreWebView2Environment *env);
 	HRESULT OnWebViewControllerCreated(HRESULT result, ICoreWebView2Controller *controller);
 	bool CreateCompositionTree();
@@ -391,6 +446,7 @@ public:
 	void SetCompositionSurfaceBounds(const PhotinoSurfaceBounds *bounds, int count);
 	void RemoveCompositionSurface(HANDLE surface);
 	void SetHitRegions(const int *rects, int count, bool regionsArePage);
+	IDropTarget *GetDropTarget() { return _dropTarget.get(); }
 	int _minWidth;
 	int _minHeight;
 	int _maxWidth;

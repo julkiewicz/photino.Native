@@ -6,6 +6,8 @@
 
 #include <windowsx.h>
 
+#include <algorithm>
+
 #pragma comment(lib, "dcomp.lib")
 
 #define HIT_REGION_HOLD_TIMER_ID 0x50484F4C
@@ -64,7 +66,317 @@ HRESULT Photino::AttachCompositionController()
 	HRESULT hr = _compositionController->put_RootVisualTarget(_dcompWebVisual.get());
 	if (SUCCEEDED(hr)) hr = _dcompDevice->Commit();
 	MarkHitRegionsStale();	// until the page publishes its first regions
+	if (SUCCEEDED(hr))
+		RegisterDropTarget();
 	return hr;
+}
+
+// ---- drag and drop ----
+
+// The window's OLE drop target: every drag over the window comes here, on the window's thread.
+class PhotinoDropTarget : public IDropTarget
+{
+public:
+	explicit PhotinoDropTarget(Photino* owner) : _owner(owner) {}
+	void Detach() { _owner = nullptr; }
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+	{
+		if (riid == IID_IUnknown || riid == IID_IDropTarget)
+		{
+			*object = static_cast<IDropTarget*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*object = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&_references); }
+	ULONG STDMETHODCALLTYPE Release() override
+	{
+		ULONG left = InterlockedDecrement(&_references);
+		if (left == 0)
+			delete this;
+		return left;
+	}
+
+	HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keyState, POINTL point, DWORD* effect) override
+	{
+		if (!_owner) { *effect = DROPEFFECT_NONE; return S_OK; }
+		return _owner->OnDragEnter(data, keyState, point, effect);
+	}
+	HRESULT STDMETHODCALLTYPE DragOver(DWORD keyState, POINTL point, DWORD* effect) override
+	{
+		if (!_owner) { *effect = DROPEFFECT_NONE; return S_OK; }
+		return _owner->OnDragOver(keyState, point, effect);
+	}
+	HRESULT STDMETHODCALLTYPE DragLeave() override
+	{
+		return _owner ? _owner->OnDragLeave() : S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keyState, POINTL point, DWORD* effect) override
+	{
+		if (!_owner) { *effect = DROPEFFECT_NONE; return S_OK; }
+		return _owner->OnDrop(data, keyState, point, effect);
+	}
+
+private:
+	Photino* _owner;
+	LONG _references = 1;
+};
+
+void Photino::RegisterDropTarget()
+{
+	// WebView2's composition controller takes drags only from its host: the window must be the drop target.
+	if (!_oleInitialized || _dropTarget || !_compositionController)
+		return;
+	if (FAILED(_compositionController->QueryInterface(IID_PPV_ARGS(&_dragController))))
+		return;
+	wil::com_ptr<IDropTarget> target;
+	target.attach(new PhotinoDropTarget(this));
+	if (FAILED(RegisterDragDrop(_hWnd, target.get())))
+	{
+		static_cast<PhotinoDropTarget*>(target.get())->Detach();
+		_dragController.reset();
+		return;
+	}
+	_dropTarget = target;
+	// The shell's drag image (a file from Explorer shows its icon over the window); optional.
+	CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&_dropHelper));
+}
+
+static std::wstring FormatsOf(IDataObject* data)
+{
+	std::wstring formats;
+	wil::com_ptr<IEnumFORMATETC> formatList;
+	if (data == nullptr || FAILED(data->EnumFormatEtc(DATADIR_GET, &formatList)) || !formatList)
+		return formats;
+	static const struct { CLIPFORMAT format; const wchar_t* name; } standard[] = {
+		{ CF_TEXT, L"CF_TEXT" }, { CF_BITMAP, L"CF_BITMAP" }, { CF_OEMTEXT, L"CF_OEMTEXT" }, { CF_DIB, L"CF_DIB" },
+		{ CF_UNICODETEXT, L"CF_UNICODETEXT" }, { CF_ENHMETAFILE, L"CF_ENHMETAFILE" }, { CF_HDROP, L"CF_HDROP" },
+		{ CF_LOCALE, L"CF_LOCALE" }, { CF_DIBV5, L"CF_DIBV5" } };
+	std::vector<CLIPFORMAT> seen;
+	FORMATETC each;
+	while (formatList->Next(1, &each, nullptr) == S_OK)
+	{
+		if (each.ptd != nullptr)
+			CoTaskMemFree(each.ptd);
+		if (std::find(seen.begin(), seen.end(), each.cfFormat) != seen.end())
+			continue;
+		seen.push_back(each.cfFormat);
+		std::wstring name;
+		for (const auto& known : standard)
+			if (known.format == each.cfFormat)
+				name = known.name;
+		if (name.empty())
+		{
+			wchar_t registered[256];
+			int length = GetClipboardFormatNameW(each.cfFormat, registered, _countof(registered));
+			name = length > 0 ? std::wstring(registered, length) : L"#" + std::to_wstring(each.cfFormat);
+		}
+		if (!formats.empty())
+			formats += L"\n";
+		formats += name;
+	}
+	return formats;
+}
+
+static bool FilesOf(IDataObject* data, std::wstring* files)
+{
+	FORMATETC format = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+	STGMEDIUM medium = {};
+	if (FAILED(data->GetData(&format, &medium)))
+		return false;
+	HDROP drop = (HDROP)GlobalLock(medium.hGlobal);
+	if (drop != nullptr)
+	{
+		UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+		for (UINT i = 0; i < count; ++i)
+		{
+			UINT length = DragQueryFileW(drop, i, nullptr, 0);
+			std::vector<wchar_t> path(length + 1);
+			DragQueryFileW(drop, i, path.data(), length + 1);
+			if (!files->empty())
+				*files += L"\n";
+			files->append(path.data(), length);
+		}
+		GlobalUnlock(medium.hGlobal);
+	}
+	ReleaseStgMedium(&medium);
+	return drop != nullptr;
+}
+
+static bool TextOf(IDataObject* data, std::wstring* text)
+{
+	FORMATETC format = { CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+	STGMEDIUM medium = {};
+	if (FAILED(data->GetData(&format, &medium)))
+		return false;
+	const wchar_t* chars = (const wchar_t*)GlobalLock(medium.hGlobal);
+	if (chars != nullptr)
+	{
+		size_t limit = GlobalSize(medium.hGlobal) / sizeof(wchar_t);
+		*text = std::wstring(chars, wcsnlen(chars, limit));
+		GlobalUnlock(medium.hGlobal);
+	}
+	ReleaseStgMedium(&medium);
+	return chars != nullptr;
+}
+
+DWORD Photino::SendHostDrop(int kind, POINT point, DWORD keyState, DWORD allowed, IDataObject* data)
+{
+	std::wstring files, text;
+	bool hasFiles = false, hasText = false;
+	if (kind == PHOTINO_HOST_DROP_DROP && data != nullptr)
+	{
+		hasFiles = FilesOf(data, &files);
+		hasText = TextOf(data, &text);
+	}
+	PhotinoHostDrop drop = { kind, point.x, point.y, keyState, allowed,
+		kind == PHOTINO_HOST_DROP_LEAVE ? nullptr : (AutoString)_dragFormats.c_str(),
+		hasFiles ? (AutoString)files.c_str() : nullptr, hasText ? (AutoString)text.c_str() : nullptr };
+	return _hostDropCallback(&drop);
+}
+
+void Photino::RouteDrag(DWORD keyState, POINT point, DWORD* effect, bool dropping)
+{
+	// By the hit regions, as the mouse: over the host's area the host is asked first (once per stay there) and may pass
+	// the drag to the page. Without a host drop handler the page has the whole window.
+	DWORD allowed = *effect;
+	bool overHostArea = _hostDropCallback != nullptr && TargetAt(point) == InputTarget::Host;
+	InputTarget side = _dragSide;
+	if (overHostArea && !_dragOverHostArea)
+	{
+		_dragOverHostArea = true;
+		DWORD answer = SendHostDrop(PHOTINO_HOST_DROP_ENTER, point, keyState, allowed, _dragData.get());
+		if (answer != PHOTINO_HOST_DROP_TO_PAGE)
+		{
+			if (side == InputTarget::Page)
+				_dragController->DragLeave();
+			_dragSide = InputTarget::Host;
+			*effect = answer & allowed;
+			return;
+		}
+		side = InputTarget::Page;	// passed to the page (it may have it already)
+	}
+	else if (!overHostArea && _dragOverHostArea)
+	{
+		_dragOverHostArea = false;
+		if (side == InputTarget::Host)
+			SendHostDrop(PHOTINO_HOST_DROP_LEAVE, point, keyState, allowed, nullptr);
+		side = InputTarget::Page;
+	}
+	else if (side == InputTarget::None)
+	{
+		side = InputTarget::Page;	// the drag's first event, outside the host's area
+	}
+
+	if (side == InputTarget::Host)
+	{
+		*effect = dropping ? allowed : SendHostDrop(PHOTINO_HOST_DROP_OVER, point, keyState, allowed, nullptr) & allowed;
+		return;
+	}
+	if (_dragSide != InputTarget::Page)
+	{
+		_dragSide = InputTarget::Page;
+		_dragController->DragEnter(_dragData.get(), keyState, point, effect);
+	}
+	else if (!dropping)
+	{
+		_dragController->DragOver(keyState, point, effect);
+	}
+}
+
+HRESULT Photino::OnDragEnter(IDataObject* data, DWORD keyState, POINTL screen, DWORD* effect)
+{
+	// A press the page still holds started this drag (WebView2 runs the page's drags itself): the drag carries the
+	// button now, and its end reaches the page through the drop, so no release is owed to the page.
+	if (_inputOwner == InputTarget::Page)
+	{
+		_inputOwner = InputTarget::None;
+		_ownerMouseKeys = 0;
+		if (GetCapture() == _hWnd)
+			ReleaseCapture();
+	}
+	EndDrag();
+	_dragData = data;
+	_dragFormats = FormatsOf(data);
+	POINT point = { screen.x, screen.y };
+	if (_dropHelper)
+		_dropHelper->DragEnter(_hWnd, data, &point, *effect);
+	ScreenToClient(_hWnd, &point);
+	RouteDrag(keyState, point, effect, false);
+	return S_OK;
+}
+
+HRESULT Photino::OnDragOver(DWORD keyState, POINTL screen, DWORD* effect)
+{
+	POINT point = { screen.x, screen.y };
+	if (_dropHelper)
+		_dropHelper->DragOver(&point, *effect);
+	ScreenToClient(_hWnd, &point);
+	if (!_dragData)
+	{
+		*effect = DROPEFFECT_NONE;
+		return S_OK;
+	}
+	RouteDrag(keyState, point, effect, false);
+	return S_OK;
+}
+
+HRESULT Photino::OnDragLeave()
+{
+	if (_dropHelper)
+		_dropHelper->DragLeave();
+	EndDrag();
+	return S_OK;
+}
+
+HRESULT Photino::OnDrop(IDataObject* data, DWORD keyState, POINTL screen, DWORD* effect)
+{
+	POINT point = { screen.x, screen.y };
+	if (_dropHelper)
+		_dropHelper->Drop(data, &point, *effect);
+	ScreenToClient(_hWnd, &point);
+	if (!_dragData)
+		_dragData = data;
+	DWORD allowed = *effect;
+	RouteDrag(keyState, point, effect, true);
+	if (_dragSide == InputTarget::Host)
+		*effect = SendHostDrop(PHOTINO_HOST_DROP_DROP, point, keyState, allowed, data) & allowed;
+	else
+	{
+		*effect = allowed;
+		_dragController->Drop(data, keyState, point, effect);
+	}
+	_dragSide = InputTarget::None;	// dropped: no leave follows
+	EndDrag();
+	return S_OK;
+}
+
+void Photino::EndDrag()
+{
+	// The drag left the window (or a new one starts): the side that has it gets its leave.
+	if (_dragSide == InputTarget::Page && _dragController)
+		_dragController->DragLeave();
+	else if (_dragSide == InputTarget::Host)
+		SendHostDrop(PHOTINO_HOST_DROP_LEAVE, { 0, 0 }, 0, 0, nullptr);
+	_dragSide = InputTarget::None;
+	_dragOverHostArea = false;
+	_dragData.reset();
+	_dragFormats.clear();
+}
+
+bool Photino::CaptureTakenByPage(HWND window)
+{
+	// WebView2's browser process runs the page's own drags and dropdowns, taking the mouse from the window (their
+	// windows share its input). The page then has the mouse itself; it is owed no release.
+	if (window == nullptr || !_webviewWindow)
+		return false;
+	UINT32 browser = 0;
+	DWORD owner = 0;
+	GetWindowThreadProcessId(window, &owner);
+	return SUCCEEDED(_webviewWindow->get_BrowserProcessId(&browser)) && browser != 0 && owner == browser;
 }
 
 UINT Photino::PlacementFlags()
@@ -456,6 +768,13 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 
 	if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST)
 	{
+		if (_dragSide != InputTarget::None)
+		{
+			// A drag is over the window: OLE's drag loop has the mouse and the drag's side gets it as drag events, as
+			// with the usual hosting, where the page's window gets no mouse messages meanwhile.
+			*result = 0;
+			return true;
+		}
 		if (_hitRegionsStale && _inputOwner == InputTarget::None && (IsMousePress(message) || !_heldInput.empty()))
 		{
 			ULONGLONG waited = GetTickCount64() - _hitRegionsStaleSince;
@@ -494,7 +813,16 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 	{
 		// Capture taken by another window (or released by the system) ends the drag on its side.
 		if ((HWND)lParam != _hWnd && _inputOwner != InputTarget::None)
-			EndMouseOwner();
+		{
+			if (_inputOwner == InputTarget::Page && CaptureTakenByPage((HWND)lParam))
+			{
+				// The page took the mouse itself (its own drag and drop, a dropdown): it holds its own button state.
+				_inputOwner = InputTarget::None;
+				_ownerMouseKeys = 0;
+			}
+			else
+				EndMouseOwner();
+		}
 		return false;
 	}
 	case WM_SETFOCUS:
@@ -643,6 +971,20 @@ void Photino::OnWindowDestroyed()
 
 	// Every window made with the options closes its controller here, so no WebView2 event reaches the host after
 	// the destroyed callback.
+	if (_dropTarget)
+	{
+		RevokeDragDrop(_hWnd);
+		EndDrag();
+		static_cast<PhotinoDropTarget*>(_dropTarget.get())->Detach();
+		_dropTarget.reset();
+		_dropHelper.reset();
+		_dragController.reset();
+	}
+	if (_oleInitialized)
+	{
+		_oleInitialized = false;
+		OleUninitialize();
+	}
 	if (_hasWindowsOptions || _compositionController || _popupOpenerHwnd != nullptr)
 	{
 		KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);

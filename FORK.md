@@ -6,7 +6,7 @@ on branch `windows-composition-hosting`, Windows only, behind a new constructor 
 
 - Modified: `Photino.Native/Photino.h`, `Photino.Native/Photino.Windows.cpp`, `Photino.Native/Exports.cpp`,
   `Photino.Native/Photino.Native.vcxproj`, `Photino.Native/Photino.Native.vcxproj.filters`.
-- Added: `Photino.Native/Photino.Windows.Composition.cpp` (composition hosting, hit-region input routing, popup
+- Added: `Photino.Native/Photino.Windows.Composition.cpp` (composition hosting, hit-region input routing, drag and drop, popup
   hosting), `packaging/windows/` (a Windows x64 package), `tests/CompositionCheck/` (a headless check run on a
   desktop of its own).
 

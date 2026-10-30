@@ -7,6 +7,7 @@
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; font: 13px sans-serif; }
   #panel { position: absolute; top: 0; right: 0; width: 300px; height: 100%; background: rgba(22, 24, 30, 0.92); color: #ddd; }
   #button { position: absolute; left: 20px; top: 20px; width: 120px; height: 40px; cursor: pointer; }
+  #dropzone { position: absolute; left: 20px; top: 66px; width: 200px; height: 28px; }
   #list { position: absolute; left: 0; top: 100px; right: 0; bottom: 0; overflow-y: scroll; }
   #list div { height: 20px; }
 </style>
@@ -14,18 +15,29 @@
 <body>
 <div id="panel">
   <button id="button">button</button>
+  <div id="dropzone">drop zone</div>
   <div id="list"></div>
 </div>
 <script>
   // The check host drives this page by web messages and reads its counters back as "report:key=value;...".
-  const counts = { pointerdown: 0, pointermove: 0, pointerup: 0, click: 0, wheel: 0, pointerleave: 0 };
+  const counts = { pointerdown: 0, pointermove: 0, pointerup: 0, click: 0, wheel: 0, pointerleave: 0, dragenter: 0, dragover: 0, dragleave: 0, drop: 0 };
   const send = (m) => window.external.sendMessage(m);
   const list = document.getElementById('list');
   for (let i = 0; i < 300; i++) { const row = document.createElement('div'); row.textContent = 'row ' + i; list.appendChild(row); }
-  for (const kind of ['pointerdown', 'pointermove', 'pointerup', 'click', 'wheel'])
+  for (const kind of ['pointerdown', 'pointermove', 'pointerup', 'click', 'wheel', 'dragenter', 'dragover', 'dragleave', 'drop'])
     document.addEventListener(kind, () => counts[kind]++, true);
   document.getElementById('panel').addEventListener('pointerleave', () => counts.pointerleave++);
-  let lastClick = '', lastWheel = '';
+  let lastClick = '', lastWheel = '', lastDrop = '';
+  window.__planted = 'kept';
+  // The drop zone takes drops (text and files); anywhere else a dropped file is the browser's to open, which the host
+  // cancels as a navigation.
+  const dropzone = document.getElementById('dropzone');
+  dropzone.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    lastDrop = 'types ' + Array.from(e.dataTransfer.types).join('|') + ' text ' + e.dataTransfer.getData('text/plain')
+      + ' files ' + Array.from(e.dataTransfer.files).map((f) => f.name).join('|') + ' at ' + e.clientX + ',' + e.clientY;
+  });
   document.addEventListener('wheel', (e) => { lastWheel = (e.target.id || e.target.parentElement.id) + '@' + e.clientX + ',' + e.clientY + ' dy ' + e.deltaY + ' cancelable ' + e.cancelable; }, true);
   document.getElementById('button').addEventListener('click', (e) => { lastClick = e.clientX + ',' + e.clientY; });
 
@@ -52,6 +64,9 @@
     parts.push('lastClick=' + lastClick);
     parts.push('lastButton=' + lastButton);
     parts.push('lastWheel=' + lastWheel);
+    parts.push('lastDrop=' + lastDrop);
+    parts.push('planted=' + window.__planted);
+    parts.push('dropzone=' + rectOf('dropzone'));
     parts.push('bodyBackground=' + getComputedStyle(document.body).backgroundColor);
     parts.push('htmlBackground=' + getComputedStyle(document.documentElement).backgroundColor);
     parts.push('dpr=' + window.devicePixelRatio);
@@ -126,7 +141,7 @@
   window.external.receiveMessage((message) => {
     const [command, argument] = [message.split(':')[0], message.slice(message.indexOf(':') + 1)];
     if (command === 'report') report();
-    else if (command === 'reset') { for (const k in counts) counts[k] = 0; lastClick = ''; list.scrollTop = 0; send('reset-done'); }
+    else if (command === 'reset') { for (const k in counts) counts[k] = 0; lastClick = ''; lastDrop = ''; list.scrollTop = 0; send('reset-done'); }
     else if (command === 'publish') publish();
     else if (command === 'freeze') { frozen = argument === 'on'; send('freeze-done'); }
     else if (command === 'echo') send('echo:' + argument);

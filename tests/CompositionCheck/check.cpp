@@ -45,6 +45,7 @@ extern "C"
 	__declspec(dllimport) void Photino_SetMinimized(Photino* instance, bool minimized);
 	__declspec(dllimport) void Photino_Restore(Photino* instance);
 	__declspec(dllimport) Photino* Photino_ctor(PhotinoInitParams* initParams);
+	__declspec(dllimport) IDropTarget* Photino_GetDropTarget_win32(Photino* instance);
 }
 
 using Clock = std::chrono::steady_clock;
@@ -75,6 +76,9 @@ static Photino* gOpener2 = nullptr;	// a second opener, closed with a request pe
 static bool gOpener2Ready = false;
 static int gOpener2Counts[3] = { -1, -1, -1 };	// its deferral counts as it was destroyed
 static int gFailures = 0;
+struct HostDropEvent { int kind; std::wstring formats, files, text; bool hasFiles, hasText; };
+static std::vector<HostDropEvent> gHostDrops;
+static unsigned int gHostDropAnswer = PHOTINO_HOST_DROP_TO_PAGE;	// the host's answer to an enter
 
 static void Check(bool ok, const std::string& name, const std::string& detail = "")
 {
@@ -269,6 +273,16 @@ static bool OnHostInput(const PhotinoHostInput* input)
 	gHostInput.push_back(*input);
 	gHostInputTimes.push_back(GetTickCount64());
 	return false;
+}
+
+static unsigned int OnHostDrop(const PhotinoHostDrop* drop)
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	gHostDrops.push_back({ drop->Kind, drop->Formats ? drop->Formats : L"", drop->Files ? drop->Files : L"",
+		drop->Text ? drop->Text : L"", drop->Files != nullptr, drop->Text != nullptr });
+	if (drop->Kind == PHOTINO_HOST_DROP_ENTER)
+		return gHostDropAnswer;
+	return gHostDropAnswer == PHOTINO_HOST_DROP_TO_PAGE ? DROPEFFECT_NONE : gHostDropAnswer;
 }
 
 static void* OnResource(AutoString url, int* numBytes, AutoString* contentType)
@@ -686,6 +700,256 @@ static void DriveNavigation()
 		tag + "a frame sent to another origin: cancelled", Narrow(frame));
 }
 
+// ---- drag and drop (composition mode) ----
+// OLE drags need the real mouse on the input desktop, which this check never touches: it calls the window's own
+// registered drop target (Photino_GetDropTarget_win32) on the window's thread, as OLE would, with data objects of its
+// own. That proves the forwarding and routing behind the drop target, not OLE's delivery to it.
+static IDropTarget* gDropTarget = nullptr;
+enum DragCallKind { DragEnterCall, DragOverCall, DragLeaveCall, DropCall };
+
+static DWORD DragCall(DragCallKind kind, IDataObject* data, int x, int y, DWORD keys = MK_LBUTTON)
+{
+	POINT screen = { x, y };
+	ClientToScreen(gMainHwnd, &screen);
+	POINTL point = { screen.x, screen.y };
+	DWORD effect = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+	OnUi(gMain, [&] {
+		if (kind == DragEnterCall) gDropTarget->DragEnter(data, keys, point, &effect);
+		else if (kind == DragOverCall) gDropTarget->DragOver(keys, point, &effect);
+		else if (kind == DragLeaveCall) gDropTarget->DragLeave();
+		else gDropTarget->Drop(data, 0, point, &effect);
+	});
+	return effect;
+}
+
+static void SetData(IDataObject* data, CLIPFORMAT format, const void* bytes, size_t size)
+{
+	HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
+	memcpy(GlobalLock(global), bytes, size);
+	GlobalUnlock(global);
+	FORMATETC formatEtc = { format, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+	STGMEDIUM medium = {};
+	medium.tymed = TYMED_HGLOBAL;
+	medium.hGlobal = global;
+	data->SetData(&formatEtc, &medium, TRUE);
+}
+
+static wil::com_ptr<IDataObject> MakeData(const std::wstring& text, const std::wstring& file)
+{
+	wil::com_ptr<IDataObject> data;
+	SHCreateDataObject(nullptr, 0, nullptr, nullptr, IID_PPV_ARGS(&data));
+	if (!text.empty())
+		SetData(data.get(), CF_UNICODETEXT, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+	if (!file.empty())
+	{
+		std::vector<char> bytes(sizeof(DROPFILES) + (file.size() + 2) * sizeof(wchar_t), 0);
+		DROPFILES* drop = (DROPFILES*)bytes.data();
+		drop->pFiles = sizeof(DROPFILES);
+		drop->fWide = TRUE;
+		memcpy(bytes.data() + sizeof(DROPFILES), file.c_str(), file.size() * sizeof(wchar_t));
+		SetData(data.get(), CF_HDROP, bytes.data(), bytes.size());
+	}
+	return data;
+}
+
+static int HostDropCount(int kind)
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	return (int)std::count_if(gHostDrops.begin(), gHostDrops.end(), [&](const HostDropEvent& e) { return e.kind == kind; });
+}
+
+static int HostDropTotal()
+{
+	std::lock_guard<std::mutex> guard(gLock);
+	return (int)gHostDrops.size();
+}
+
+static void ResetDrag(unsigned int answer)
+{
+	ResetPage();
+	std::lock_guard<std::mutex> guard(gLock);
+	gHostDrops.clear();
+	gHostDropAnswer = answer;
+}
+
+static std::string DragCounts(std::map<std::string, std::string>& r)
+{
+	return "page enter " + r["dragenter"] + " over " + r["dragover"] + " leave " + r["dragleave"] + " drop " + r["drop"]
+		+ "; host enter " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_ENTER)) + " over " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_OVER))
+		+ " leave " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_LEAVE)) + " drop " + std::to_string(HostDropCount(PHOTINO_HOST_DROP_DROP));
+}
+
+static void DriveDragDrop()
+{
+	HRESULT again = E_FAIL;
+	OnUi(gMain, [&] {
+		gDropTarget = Photino_GetDropTarget_win32(gMain);
+		if (gDropTarget)
+			again = RegisterDragDrop(gMainHwnd, gDropTarget);
+	});
+	Check(gDropTarget != nullptr && again == DRAGDROP_E_ALREADYREGISTERED, "drag and drop: the window is registered as its OLE drop target");
+	if (!gDropTarget)
+		return;
+
+	auto r = Report();
+	std::vector<int> zone = Ints(r["dropzone"]), list = Ints(r["list"]);
+	int dx = zone[0] + zone[2] / 2, dy = zone[1] + zone[3] / 2;
+	int lx = list[0] + list[2] / 2, ly = list[1] + 100;
+	int sx = 200, sy = 400;	// the host's area
+	std::wstring file = std::wstring(CHECK_WEB_DIR) + L"/popup.html";
+	std::replace(file.begin(), file.end(), L'/', L'\\');
+
+	// Text over the page's drop zone: the page's drag events and its drop, with the effect it chose; the host, though it
+	// would take anything, is never asked over the page.
+	ResetDrag(DROPEFFECT_COPY);
+	auto text = MakeData(L"dropped text", L"");
+	DragCall(DragEnterCall, text.get(), dx, dy);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, dx + 2, dy);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, dx + 4, dy);
+	Settle(150);
+	DWORD effect = DragCall(DropCall, text.get(), dx + 4, dy);
+	Settle();
+	r = Report();
+	Check(Int(r, "dragenter") >= 1 && Int(r, "drop") == 1 && r["lastDrop"].find("text dropped text") != std::string::npos
+		&& effect == DROPEFFECT_COPY && HostDropTotal() == 0,
+		"drag and drop: text over the page's drop zone reaches the page (drop, copy); the host is not asked",
+		r["lastDrop"] + "; effect " + std::to_string(effect) + "; " + DragCounts(r));
+
+	// A file over the page where nothing takes it: the browser would open it; the host's navigation filter cancels that.
+	ResetDrag(DROPEFFECT_COPY);
+	size_t navigationsBefore;
+	{
+		std::lock_guard<std::mutex> guard(gLock);
+		navigationsBefore = gNavigations.size();
+	}
+	auto fileData = MakeData(L"", file);
+	DragCall(DragEnterCall, fileData.get(), lx, ly);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, lx + 2, ly);
+	Settle(150);
+	effect = DragCall(DropCall, fileData.get(), lx + 2, ly);
+	Settle(1000);
+	r = Report();
+	std::vector<std::wstring> asked;
+	{
+		std::lock_guard<std::mutex> guard(gLock);
+		asked.assign(gNavigations.begin() + navigationsBefore, gNavigations.end());
+	}
+	std::string askedText = asked.empty() ? "none" : "";
+	bool allowedElsewhere = false;
+	for (auto& uri : asked)
+	{
+		bool refused = Refused(uri);
+		allowedElsewhere |= !refused;
+		askedText += Narrow(uri) + (refused ? " (cancelled) " : " (allowed) ");
+	}
+	Check(r["planted"] == "kept" && Int(r, "drop") == 0 && !allowedElsewhere && HostDropCount(PHOTINO_HOST_DROP_ENTER) == 0,
+		"drag and drop: a file dropped on the page where nothing takes it does not navigate the page",
+		"navigations asked: " + askedText + "; effect " + std::to_string(effect) + "; " + DragCounts(r));
+
+	// Over the host's area, a host that takes the drag: enter (with the data's formats), over, drop (files and text).
+	ResetDrag(DROPEFFECT_COPY);
+	auto both = MakeData(L"host text", file);
+	DragCall(DragEnterCall, both.get(), sx, sy);
+	DWORD overEffect = DragCall(DragOverCall, nullptr, sx + 5, sy);
+	effect = DragCall(DropCall, both.get(), sx + 5, sy);
+	Settle();
+	r = Report();
+	HostDropEvent enter = {}, drop = {};
+	{
+		std::lock_guard<std::mutex> guard(gLock);
+		for (auto& e : gHostDrops)
+		{
+			if (e.kind == PHOTINO_HOST_DROP_ENTER) enter = e;
+			if (e.kind == PHOTINO_HOST_DROP_DROP) drop = e;
+		}
+	}
+	Check(enter.formats.find(L"CF_HDROP") != std::wstring::npos && enter.formats.find(L"CF_UNICODETEXT") != std::wstring::npos
+		&& HostDropCount(PHOTINO_HOST_DROP_OVER) == 1 && HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 0 && drop.files == file && drop.text == L"host text"
+		&& overEffect == DROPEFFECT_COPY && effect == DROPEFFECT_COPY && Int(r, "dragenter") == 0,
+		"drag and drop: over the host's area the host gets enter (formats), over and drop (files, text); the page nothing",
+		"formats " + Narrow(enter.formats) + "; files " + Narrow(drop.files) + "; " + DragCounts(r));
+
+	// A host that passes the drag: the page has it there; the host hears only the enter.
+	ResetDrag(PHOTINO_HOST_DROP_TO_PAGE);
+	DragCall(DragEnterCall, both.get(), sx, sy);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, sx + 5, sy);
+	Settle(150);
+	DragCall(DragLeaveCall, nullptr, 0, 0);
+	Settle();
+	r = Report();
+	Check(HostDropCount(PHOTINO_HOST_DROP_ENTER) == 1 && HostDropTotal() == 1 && Int(r, "dragenter") >= 1 && Int(r, "dragleave") >= 1,
+		"drag and drop: a host passing the drag to the page: the page has it over the host's area", DragCounts(r));
+
+	// Crossing the region's edge both ways: the side left gets its leave, the side entered its enter.
+	ResetDrag(DROPEFFECT_COPY);
+	DragCall(DragEnterCall, text.get(), sx, sy);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, lx, ly);
+	Settle(150);
+	DragCall(DragOverCall, nullptr, sx, sy);
+	Settle(150);
+	DragCall(DragLeaveCall, nullptr, 0, 0);
+	Settle();
+	r = Report();
+	Check(HostDropCount(PHOTINO_HOST_DROP_ENTER) == 2 && HostDropCount(PHOTINO_HOST_DROP_LEAVE) == 2 && Int(r, "dragenter") >= 1 && Int(r, "dragleave") >= 1,
+		"drag and drop: crossing from the host's area to the page and back: leave and enter on each side", DragCounts(r));
+
+	// A drag the page starts from a press it holds: the drag carries the press, so the page is no longer its owner; while
+	// the drag is over the window no mouse message is routed (OLE's loop has the mouse).
+	ResetDrag(PHOTINO_HOST_DROP_TO_PAGE);
+	Post(WM_LBUTTONDOWN, lx, ly, MK_LBUTTON);
+	Settle(150);
+	DragCall(DragEnterCall, text.get(), lx, ly);
+	Post(WM_MOUSEMOVE, sx, sy, MK_LBUTTON);
+	Post(WM_MOUSEMOVE, lx, ly, MK_LBUTTON);
+	Settle();
+	r = Report();
+	int movesDuringDrag = HostCount(WM_MOUSEMOVE) + Int(r, "pointermove");
+	DragCall(DragLeaveCall, nullptr, 0, 0);
+	Post(WM_MOUSEMOVE, sx, sy, 0);
+	Settle();
+	Check(movesDuringDrag == 0 && HostCount(WM_MOUSEMOVE) >= 1,
+		"drag and drop: a drag entering while the page holds a press frees the press; no mouse routed during the drag",
+		"moves routed during the drag " + std::to_string(movesDuringDrag) + ", host moves after " + std::to_string(HostCount(WM_MOUSEMOVE)));
+	Post(WM_LBUTTONUP, lx, ly, 0);
+	Settle();
+
+	// Capture taken by WebView2's own browser process (its drag loop, a dropdown) during a page press: no release is
+	// sent to the page, and the press is freed.
+	HWND browserWindow = nullptr;
+	EnumChildWindows(gMainHwnd, [](HWND child, LPARAM found) -> BOOL {
+		DWORD process = 0;
+		GetWindowThreadProcessId(child, &process);
+		if (process != GetCurrentProcessId()) { *(HWND*)found = child; return FALSE; }
+		return TRUE;
+	}, (LPARAM)&browserWindow);
+	if (browserWindow == nullptr)
+	{
+		// Here WebView2 made no window of its browser process inside this one, so that process shares no input with it
+		// and its capture cannot reach the window; the case is left to a visible run (a dropdown opened by a press).
+		Check(true, "drag and drop: capture by WebView2's browser process (information)", "no child window of that process here: not driven");
+		return;
+	}
+	ResetDrag(PHOTINO_HOST_DROP_TO_PAGE);
+	Post(WM_LBUTTONDOWN, lx, ly, MK_LBUTTON);
+	Settle(150);
+	PostMessage(gMainHwnd, WM_CAPTURECHANGED, 0, (LPARAM)browserWindow);
+	Settle();
+	r = Report();
+	int upsAfterCapture = Int(r, "pointerup");
+	Post(WM_MOUSEMOVE, sx, sy, 0);
+	Settle();
+	Check(upsAfterCapture == 0 && HostCount(WM_MOUSEMOVE) >= 1,
+		"drag and drop: capture taken by WebView2's browser process during a page press: no release sent, the press freed",
+		"page ups " + std::to_string(upsAfterCapture) + ", host moves after " + std::to_string(HostCount(WM_MOUSEMOVE)));
+	Post(WM_LBUTTONUP, lx, ly, 0);
+	Settle();
+}
+
 static void DrivePopups()
 {
 	const wchar_t* mode = gComposition ? L"composition" : L"default";
@@ -919,6 +1183,7 @@ int wmain(int argc, wchar_t** argv)
 	options.PopupRequestTimeoutMilliseconds = 1500;
 	options.NavigationStartingHandler = OnNavigationStarting;
 	options.BrowserAcceleratorKeysDisabled = true;
+	options.HostDropHandler = OnHostDrop;
 	gMain = gLegacy ? Photino_ctor(&params) : Photino_ctorWithOptions_win32(&params, &options);
 	gMainHwnd = Photino_getHwnd_win32(gMain);
 
@@ -931,6 +1196,8 @@ int wmain(int argc, wchar_t** argv)
 		if (!gNoHold && !gLegacy)
 		{
 			DriveNavigation();
+			if (gComposition)
+				DriveDragDrop();
 			DrivePopups();
 		}
 		printf("mode took %lld ms\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
