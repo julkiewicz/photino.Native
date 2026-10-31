@@ -884,10 +884,6 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 	}
 	case WM_CAPTURECHANGED:
 	{
-		// The capture the held press took is gone: a flush after it must not let go of a capture taken since (a sizing
-		// or moving loop's).
-		if ((HWND)lParam != _hWnd)
-			_holdTookCapture = false;
 		// Capture taken by another window (or released by the system) ends the drag on its side.
 		if ((HWND)lParam != _hWnd && _inputOwner != InputTarget::None)
 		{
