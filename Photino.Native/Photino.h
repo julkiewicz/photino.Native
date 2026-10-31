@@ -347,6 +347,7 @@ private:
 	bool _hitRegionsStale = false;
 	ULONGLONG _hitRegionsStaleSince = 0;
 	std::vector<HeldInput> _heldInput;
+	bool _holdTookCapture = false;	// the capture the held press took, the only one the flush lets go of
 	InputTarget _inputOwner = InputTarget::None;
 	InputTarget _hoverTarget = InputTarget::None;
 	bool _trackingMouseLeave = false;

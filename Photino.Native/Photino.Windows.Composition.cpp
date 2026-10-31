@@ -651,6 +651,8 @@ void Photino::FlushHeldInput()
 	KillTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID);
 	std::vector<HeldInput> held;
 	held.swap(_heldInput);
+	bool tookCapture = _holdTookCapture;
+	_holdTookCapture = false;
 	bool foreground = GetForegroundWindow() == _hWnd;
 	for (size_t i = 0; i < held.size(); ++i)
 	{
@@ -673,7 +675,10 @@ void Photino::FlushHeldInput()
 		}
 		RouteMouse(input.message, input.wParam, input.lParam);
 	}
-	if (_inputOwner == InputTarget::None && GetCapture() == _hWnd)
+	// Only the hold's own capture is let go: the window's capture may be the system's sizing or moving loop's, begun on
+	// its frame, which a size change (marking the regions stale) and the page's publish that follows come during, and
+	// letting it go cancels the loop and puts the window back as it was.
+	if (tookCapture && _inputOwner == InputTarget::None && GetCapture() == _hWnd)
 		ReleaseCapture();
 }
 
@@ -849,7 +854,10 @@ bool Photino::HandleHostingMessage(UINT message, WPARAM wParam, LPARAM lParam, L
 				{
 					SetTimer(_hWnd, HIT_REGION_HOLD_TIMER_ID, (UINT)(_hitRegionHoldMilliseconds - waited), nullptr);
 					if (IsMousePress(message) && GetForegroundWindow() == _hWnd)
+					{
 						SetCapture(_hWnd);	// so the release arrives even outside the window
+						_holdTookCapture = true;
+					}
 				}
 				_heldInput.push_back({ message, wParam, lParam });
 				*result = 0;

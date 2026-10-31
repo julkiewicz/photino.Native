@@ -682,6 +682,31 @@ static void DriveComposition()
 		Check(!republished.empty() && Int(r, "click") == 1 && HostCount(WM_LBUTTONDOWN) == 0,
 			"hold: a press after a resize is held until the new region, then reaches the page's moved button",
 			"region republished within " + std::to_string(arrived - posted) + " ms, clicks " + r["click"] + ", host presses " + std::to_string(HostCount(WM_LBUTTONDOWN)));
+
+	if (!gNoHold)
+	{
+		// The system's sizing loop (a drag of the window's frame) holds the window's capture while it sizes the window, and
+		// a capture lost cancels the loop, putting the window back as it was: the size change marks the regions stale, and
+		// the page's publish that follows flushes the hold, which lets go of no capture it did not take.
+		HWND captured = nullptr;
+		OnUi(gMain, [&] {
+			SetCapture(gMainHwnd);
+			Photino_SetSize(gMain, 1100, 720);
+		});
+		std::wstring sized = WaitFor(L"regions-published:");
+		Settle();
+		OnUi(gMain, [&] {
+			captured = GetCapture();
+			if (captured == gMainHwnd)
+				ReleaseCapture();
+		});
+		Check(!sized.empty() && captured == gMainHwnd,
+			"hold: a size change while the window holds its own capture (the system's sizing loop) keeps the capture through the page's publish",
+			captured == gMainHwnd ? "kept" : "let go");
+		OnUi(gMain, [&] { Photino_SetSize(gMain, 1280, 800); });
+		WaitFor(L"regions-published:");
+		Settle();
+	}
 }
 
 static void DriveNavigation()
